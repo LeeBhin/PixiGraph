@@ -871,8 +871,8 @@ export class PixiGraph {
   get centerResizeEnabled(): boolean { return this._centerResize; }
   /** 비율 유지 리사이즈 기본값(Shift 로 일시 토글). */
   get keepAspectEnabled(): boolean { return this._keepAspect; }
-  /** 노드 이동(드래그) 활성 여부. */
-  get moveEnabled(): boolean { return this._handleMove; }
+  /** 노드 이동(드래그) 활성 여부. 핸들 자체가 disabled 면 항상 false. */
+  get moveEnabled(): boolean { return this._handlesEnabled && this._handleMove; }
 
   /** 핸들 key → CSS resize 커서. */
   static handleCursor(key: string): string {
@@ -888,6 +888,8 @@ export class PixiGraph {
 
   /** (x,y) graph-local 에서 핸들 위면 {key, nodeId, rotation}, 아니면 null. rotation=해당 노드/그룹 회전(rad). */
   handleAt(x: number, y: number): { key: string; nodeId: string | null; rotation: number } | null {
+    // 핸들이 disabled 면 hit-test 도 비활성 — 보이지 않는 핸들 클릭 영역으로 리사이즈 시작되는 버그 방지.
+    if (!this._handlesEnabled) return null;
     const half = this._handleLocalSize() / 2;
     for (const box of this._handleBoxes()) {
       for (const h of this._bboxHandles(box.bbox, box.rotation)) {
