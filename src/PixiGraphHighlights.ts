@@ -32,6 +32,12 @@ export interface PixiGraphHighlightInput {
   elements: PixiGraphElement[];
   /** 매칭 element 에 적용할 inline style. fill/stroke/alpha/width 등. */
   style: PixiGraphStyleProps;
+  /**
+   * true 면 이 그룹은 auto-dim 트리거에서 제외 — 다른 그룹이 활성일 때처럼 나머지 element 를
+   * `.dim` 처리하지 않음. 협업 selection lock 처럼 "표시만 하고 나머지는 그대로" 용도.
+   * 기본 false.
+   */
+  noDim?: boolean;
 }
 
 /** PixiGraph 가 manager 에 주입 — element 재렌더 + 전체 element 접근. */
@@ -45,6 +51,7 @@ interface ResolvedHighlight {
   id: string;
   elements: PixiGraphElement[];
   style: PixiGraphStyleProps;
+  noDim: boolean;
 }
 
 /** PixiGraphElement 의 internal highlight set 접근용 — 외부 노출 X. */
@@ -79,6 +86,7 @@ export class HighlightManager {
       id: input.id,
       elements: [...input.elements],
       style: { ...input.style },
+      noDim: !!input.noDim,
     };
     this.highlights.set(input.id, resolved);
     resolved.elements.forEach((ele) => {
@@ -115,8 +123,14 @@ export class HighlightManager {
     this._updateDim();
   }
 
-  /** highlight 그룹이 하나라도 활성인지. PixiGraph 가 add 시 새 element dim 결정에 사용. */
-  isAnyActive(): boolean { return this.highlights.size > 0; }
+  /** dim 트리거용 — noDim 그룹은 제외하고 카운트. PixiGraph 가 add 시 새 element dim 결정에 사용. */
+  isAnyActive(): boolean {
+    for (const h of this.highlights.values()) { if (!h.noDim) return true; }
+    return false;
+  }
+
+  /** 등록된 모든 그룹 개수 (noDim 포함). 호환성/디버깅용. */
+  totalCount(): number { return this.highlights.size; }
 
   /**
    * Focus color set/clear — null 이면 focus 모드 해제.
@@ -160,7 +174,8 @@ export class HighlightManager {
    * `.dim` 과 `.focus-dim` 둘 다 PixiGraph 의 _systemStyleRules 가 시각 정의 — 외부 코드 추가 안 해도 동작.
    */
   _updateDim(): void {
-    const anyActive = this.highlights.size > 0;
+    // noDim 그룹은 dim 트리거에서 제외.
+    const anyActive = this.isAnyActive();
     const focus = this._focusColor;
     this.graph.elements().forEach((ele) => {
       const inGroup = (ele as HighlightableElement)._highlightGroupIds.size > 0;
