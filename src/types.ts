@@ -186,4 +186,11 @@ export interface PixiGraphConfig {
   selectionHandles?: boolean | PixiGraphHandleOptions;
   /** true 또는 옵션 객체면 호버 툴팁 시스템 활성. 렌더링은 별도 컴포넌트(PixiGraphTooltip). */
   tooltip?: boolean | PixiGraphTooltipOptions;
+  /**
+   * true 또는 옵션 객체면 viewport(카메라) 모듈 활성.
+   * 활성 시 `graph.view` 가 viewport 의 외부 컨테이너가 되고,
+   * `graph.viewport` 로 pan/zoom/fit/panToElement 등 호출 가능.
+   * 자동으로 setViewScale / setHitTolerance 동기화.
+   */
+  viewport?: boolean | import('./PixiGraphViewport').PixiGraphViewportConfig;
 }

@@ -31,3 +31,5 @@ export type { PixiGraphHighlightInput } from './PixiGraphHighlights';
 export { ptSegDist, projectOnSeg } from './PixiGraphGeometry';
 export { PixiGraphPreview } from './PixiGraphPreview';
 export { PixiGraphHistory } from './PixiGraphHistory';
+export { PixiGraphViewport } from './PixiGraphViewport';
+export type { PixiGraphViewportConfig, PanOptions, ViewportTween } from './PixiGraphViewport';

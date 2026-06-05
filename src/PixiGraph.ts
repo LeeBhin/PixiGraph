@@ -59,6 +59,7 @@ import * as ClipboardModule from './PixiGraphClipboard';
 import { ptSegDist, projectOnSeg } from './PixiGraphGeometry';
 import { PixiGraphPreview } from './PixiGraphPreview';
 import { PixiGraphHistory } from './PixiGraphHistory';
+import { PixiGraphViewport, type PixiGraphViewportConfig, type PanOptions } from './PixiGraphViewport';
 
 /**
  * 점 (px, py) 에서 선분 (x1,y1)→(x2,y2) 까지 최단거리.
@@ -155,7 +156,20 @@ export class PixiGraph {
    *
    * 내부 구조 — edges 가 nodes 아래 깔리도록 두 sublayer 분리.
    */
-  public readonly view: Container;
+  /** 그래프 내용 컨테이너 (edges/nodes/handles layer). 외부 노출은 `view` getter 로. */
+  private readonly _content: Container;
+  /** viewport 활성 시에만 존재. pan/zoom/fit/panToElement 진입점. */
+  private readonly _viewport: PixiGraphViewport | null;
+
+  /**
+   * consumer 가 stage 에 add 하는 컨테이너.
+   *  - viewport 활성: viewport 의 외부 컨테이너 (내부 world 가 graph content 를 감쌈).
+   *  - viewport 비활성: graph content 컨테이너 (기존 동작).
+   */
+  public get view(): Container { return this._viewport ? this._viewport.view : this._content; }
+
+  /** viewport 인스턴스 — 비활성이면 null. pan/zoom/fit/panToElement 등 모든 카메라 API. */
+  public get viewport(): PixiGraphViewport | null { return this._viewport; }
 
   private readonly edgesLayer: Container;
   private readonly nodesLayer: Container;
@@ -243,16 +257,22 @@ export class PixiGraph {
   private _userStyleRules: PixiGraphStyleRule[] = [];
 
   constructor(config: PixiGraphConfig = {}) {
-    this.view = new Container();
+    this._content = new Container();
     this.edgesLayer = new Container();
     this.nodesLayer = new Container();
     this.handlesLayer = new Container();
     this.handlesGfx = new Graphics();
     this.handlesGfx.eventMode = 'none';
     this.handlesLayer.addChild(this.handlesGfx);
-    this.view.addChild(this.edgesLayer);
-    this.view.addChild(this.nodesLayer);
-    this.view.addChild(this.handlesLayer); // 노드 위
+    this._content.addChild(this.edgesLayer);
+    this._content.addChild(this.nodesLayer);
+    this._content.addChild(this.handlesLayer); // 노드 위
+
+    // viewport — 옵션 활성 시 _content 를 감싸 외부에는 viewport.view 노출.
+    const vpCfg = config.viewport;
+    this._viewport = vpCfg
+      ? new PixiGraphViewport(this, this._content, typeof vpCfg === 'object' ? vpCfg : undefined)
+      : null;
 
     // 선택 핸들 옵션 — 전부 커스텀.
     const h = config.selectionHandles;
@@ -1803,6 +1823,38 @@ export class PixiGraph {
   isCopyDragActive(): boolean { return ClipboardModule.isCopyDragActive(); }
 
   // ──────────────────────────────────────────────────────────
+  // viewport delegates — viewport 활성 시 graph.X 로 직접 호출 가능 (cytoscape-like).
+  //   비활성 시 false / null 반환 — consumer 가 직접 transform 관리.
+  // ──────────────────────────────────────────────────────────
+
+  /** viewport 활성 시 elements 합집합 bbox 에 fit. consumer 사용 빈도 높아 graph 에 직접 노출. */
+  fit(elements?: PixiGraphElement[], opts?: PanOptions): boolean {
+    return this._viewport ? this._viewport.fit(elements, opts) : false;
+  }
+  /** viewport 활성 시 elements 중심으로 이동(zoom 유지). */
+  center(elements?: PixiGraphElement[], opts?: PanOptions): boolean {
+    return this._viewport ? this._viewport.center(elements, opts) : false;
+  }
+  /** viewport 활성 시 id/element/배열 으로 pan + (옵션) 선택. */
+  panToElement(
+    target: string | PixiGraphElement | (string | PixiGraphElement)[] | { ids?: (string | PixiGraphElement)[]; path?: (string | PixiGraphElement)[] },
+    opts?: PanOptions,
+  ): boolean {
+    return this._viewport ? this._viewport.panToElement(target, opts) : false;
+  }
+  panToElements(targets: (string | PixiGraphElement)[], opts?: PanOptions): boolean {
+    return this._viewport ? this._viewport.panToElements(targets, opts) : false;
+  }
+  /** viewport 활성 시 임의 graph-local bbox 에 fit (image 영역 등). */
+  panToBbox(bbox: import('./types').GraphBbox, opts?: PanOptions): boolean {
+    return this._viewport ? this._viewport.panToBbox(bbox, opts) : false;
+  }
+  /** viewport 활성 시 현재 zoom. 비활성 시 null. */
+  get zoom(): number | null { return this._viewport?.zoom ?? null; }
+  /** viewport 활성 시 현재 pan. 비활성 시 null. */
+  get pan(): { x: number; y: number } | null { return this._viewport?.pan ?? null; }
+
+  // ──────────────────────────────────────────────────────────
   // lifecycle
   // ──────────────────────────────────────────────────────────
 
@@ -1811,10 +1863,12 @@ export class PixiGraph {
     this.destroyed = true;
     this.eventBus.destroy();
     this.clear();
+    try { this._viewport?.destroy(); } catch { /* noop */ }
     try { this.edgesLayer.destroy({ children: true }); } catch { /* noop */ }
     try { this.nodesLayer.destroy({ children: true }); } catch { /* noop */ }
-    try { this.view.parent?.removeChild(this.view); } catch { /* noop */ }
-    try { this.view.destroy({ children: true }); } catch { /* noop */ }
+    const outer = this.view;
+    try { outer.parent?.removeChild(outer); } catch { /* noop */ }
+    try { outer.destroy({ children: true }); } catch { /* noop */ }
   }
 
   /** 외부에서 graph 가 살아있는지 확인 (option). */
