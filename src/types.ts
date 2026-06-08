@@ -44,6 +44,14 @@ export interface PixiGraphNodeInput {
   shape?: PixiGraphNodeShape;
   /** 다각형 꼭짓점 — bbox 기준 [0,1] 정규화된 flat 배열 [x0,y0,x1,y1,...]. 호출부에서 도메인 좌표를 변환해 전달. */
   polygonPoints?: number[];
+  /**
+   * 노드 시각을 이미지/SVG 로 렌더 — bbox 에 stretch fit.
+   *   - data URL (`data:image/svg+xml,...`), http(s) URL, blob URL, 또는 import 된 asset URL 가능.
+   *   - shape 와 무관 (rect/circle/polygon 모두 bbox 영역을 texture 로 채움 → 모양에 맞춰 자동 마스킹).
+   *   - 동일 URL 은 graph 단위 캐시되어 중복 fetch/디코딩 없음.
+   *   - 로드 완료 전에는 fallback color(fill) 로 잠시 표시되고 완료 즉시 자동 재렌더.
+   */
+  image?: string;
 }
 
 /**

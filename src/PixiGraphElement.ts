@@ -65,6 +65,8 @@ export class PixiGraphElement {
   // 노드 모양/기하 — 도메인 무관 1급 속성. 라이브러리는 도메인 데이터(data.properties.*) 안 봄.
   private _shape: 'rect' | 'circle' | 'polygon' | null = null;
   private _polygonPoints: number[] | null = null; // bbox 기준 [0,1] 정규화
+  // 노드 시각을 image/SVG 로 렌더 — graph 가 texture-fill 로 bbox 에 stretch.
+  private _image: string | null = null;
   // 요소별 편집 가능 플래그(cytoscape 스타일). 노드 한정 의미 있는 것도 있음.
   private _selectable = true;
   private _resizable = true;
@@ -155,6 +157,18 @@ export class PixiGraphElement {
   polygonPoints(v?: number[] | null): (number[] | null) | this {
     if (v === undefined) return this._polygonPoints;
     this._polygonPoints = v ? v.slice() : null; return this;
+  }
+  /**
+   * 노드 시각용 image/SVG URL. null 이면 기본 color fill.
+   * 설정 시 graph 가 texture 비동기 로드 + 캐시 후 재렌더 트리거.
+   */
+  image(): string | null;
+  image(v: string | null): this;
+  image(v?: string | null): (string | null) | this {
+    if (v === undefined) return this._image;
+    this._image = v || null;
+    this._graph._restyleElement?.(this);
+    return this;
   }
 
   // ── 요소별 편집 플래그 (cytoscape 스타일 getter/setter — 인자 없으면 read, 있으면 set+chainable) ──

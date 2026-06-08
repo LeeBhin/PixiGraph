@@ -32,7 +32,7 @@
  * world ↔ local 변환을 담당하므로 graph 내부에선 단위 일관.
  */
 
-import { Container, Graphics } from 'pixi.js';
+import { Container, Graphics, Texture, Matrix, Assets } from 'pixi.js';
 import {
   DEFAULT_PIXIGRAPH_STYLE,
   type GraphBbox,
@@ -178,6 +178,13 @@ export class PixiGraph {
   private readonly _edgesByPair = new Map<string, Set<PixiGraphElement>>();
   /** 전역 dash offset — 흐름 시뮬 등 dash 애니메이션용. setDashOffset 으로 갱신 + 점선 엣지 재렌더. */
   private _dashOffsetGlobal = 0;
+  /**
+   * 이미지/SVG 노드용 texture 캐시 — URL → Texture 또는 로딩 중 Promise.
+   *   - 같은 URL 의 노드가 여럿이면 fetch 1회만.
+   *   - 로드 완료 시 cache 에 Texture 채워두고 해당 URL 을 쓰는 모든 노드 재렌더.
+   *   - graph.destroy 시 정리 (texture.destroy 호출).
+   */
+  private readonly _imageTextureCache = new Map<string, Texture | Promise<Texture | null>>();
   /** 노드 group 기본 스타일 — 매칭 규칙 없을 때 fallback. config 로 override 가능. */
   private readonly nodeDefaults: PixiGraphStyleProps;
   /** 엣지 group 기본 스타일 — 매칭 규칙 없을 때 fallback. */
@@ -455,6 +462,8 @@ export class PixiGraph {
     // 모양/기하 — 1급 속성으로 설정(라이브러리는 도메인 데이터 안 봄).
     if (input.shape) ele.shape(input.shape);
     if (input.polygonPoints) ele.polygonPoints(input.polygonPoints);
+    // image — 노드 시각용 texture URL. 비동기 load (renderElement 내부에서 처리).
+    if (input.image) ele.image(input.image);
     // 새 element 가 현재 hidden / highlight-dim 상태 상속 — class add 가 renderElement 자동 트리거.
     if (this._hidden) ele.addClass('hidden');
     if (this.highlightManager.isAnyActive()) ele.addClass('dim');
@@ -1467,6 +1476,39 @@ export class PixiGraph {
     this.renderElement(ele);
   }
 
+  /**
+   * image URL → 캐시된 Texture (즉시 반환) 또는 null (로딩 중 / 실패).
+   *   - cache miss: Assets.load 비동기 시작 + Promise 캐시. 완료 시 Texture 캐시 + 호출 element 재렌더.
+   *   - 같은 URL 의 후속 노드는 Promise 가 풀리면 모두 재렌더되지 않음 — 추후 add 노드는 자체 first render
+   *     시점에 cache hit 으로 즉시 texture 받음. 이미 그려진 노드들은 본인이 다시 재렌더되어야 반영되는데,
+   *     첫 노드의 Promise resolve 콜백이 같은 URL 사용하는 모든 element 재렌더하도록 처리.
+   *   - destroyed graph 면 진행 중 로딩은 무시 (texture set 시점에 destroy 체크).
+   */
+  private _getImageTexture(url: string, requester: PixiGraphElement): Texture | null {
+    const cached = this._imageTextureCache.get(url);
+    if (cached instanceof Texture) return cached;
+    if (cached) return null; // 로딩 중 — 완료 후 자동 재렌더 예약됨.
+    // cache miss → load 시작.
+    const p = Assets.load<Texture>(url).then((tex) => {
+      if (this.destroyed) return null;
+      this._imageTextureCache.set(url, tex);
+      // 같은 URL 을 쓰는 모든 노드 재렌더.
+      this.elementMap.forEach((el) => {
+        if (el.isNode() && el.image() === url) this.renderElement(el);
+      });
+      return tex;
+    }).catch(() => {
+      if (this.destroyed) return null;
+      // 로드 실패 — cache 에서 제거 (다음 시도 가능). 실패한 노드는 fallback color 로 유지.
+      this._imageTextureCache.delete(url);
+      return null;
+    });
+    this._imageTextureCache.set(url, p);
+    // requester 가 처음 호출자 — Promise 콜백에서 위 forEach 가 처리해주므로 여기선 noop.
+    void requester;
+    return null;
+  }
+
   // ──────────────────────────────────────────────────────────
   // 렌더링 (내부)
   // ──────────────────────────────────────────────────────────
@@ -1497,10 +1539,27 @@ export class PixiGraph {
       if (flat) g.poly(flat);
       else if (shape === 'circle') g.ellipse(cx, cy, b.w / 2, b.h / 2);
       else g.rect(b.x, b.y, b.w, b.h);
-      g.fill({
-        color: s.fill ?? this.nodeDefaults.fill ?? 0x000000,
-        alpha: s.alpha ?? this.nodeDefaults.alpha ?? 1,
-      });
+      // image URL 지정 시 texture-fill (모양 안쪽이 자동 마스크 역할).
+      //   stretch-to-bbox — texture (0..1) → bbox(b.x..b.x+b.w) 매트릭스.
+      //   highlight tint/alpha 가 있으면 함께 적용 (texture color 곱셈).
+      const imgUrl = ele.image();
+      const tex = imgUrl ? this._getImageTexture(imgUrl, ele) : null;
+      if (tex) {
+        const tw = tex.width || tex.frame?.width || b.w;
+        const th = tex.height || tex.frame?.height || b.h;
+        const matrix = new Matrix(b.w / tw, 0, 0, b.h / th, b.x, b.y);
+        g.fill({
+          texture: tex,
+          matrix,
+          color: s.fill ?? 0xffffff,
+          alpha: s.alpha ?? 1,
+        });
+      } else {
+        g.fill({
+          color: s.fill ?? this.nodeDefaults.fill ?? 0x000000,
+          alpha: s.alpha ?? this.nodeDefaults.alpha ?? 1,
+        });
+      }
       return;
     }
     // edge
@@ -1866,6 +1925,13 @@ export class PixiGraph {
     try { this._viewport?.destroy(); } catch { /* noop */ }
     try { this.edgesLayer.destroy({ children: true }); } catch { /* noop */ }
     try { this.nodesLayer.destroy({ children: true }); } catch { /* noop */ }
+    // image texture 캐시 정리 — Texture 만 destroy (Promise 는 자체 catch 로 noop).
+    this._imageTextureCache.forEach((v) => {
+      if (v instanceof Texture) {
+        try { v.destroy(true); } catch { /* noop */ }
+      }
+    });
+    this._imageTextureCache.clear();
     const outer = this.view;
     try { outer.parent?.removeChild(outer); } catch { /* noop */ }
     try { outer.destroy({ children: true }); } catch { /* noop */ }
