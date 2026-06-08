@@ -1162,24 +1162,102 @@ export class PixiGraph {
 
   /** 두 노드 사이 엣지의 끝점(표면 clip) + AABB. addEdge / 노드 이동 재계산 공용.
    *  노드끼리 겹치면(한쪽 중심이 다른 쪽 bbox 안) clip 이 반대편으로 튀어 선 방향이 반전됨 →
-   *  이 경우 중심 그대로 사용해서 sc → tc 방향 유지(arrow 방향 보존).
+   *  이 경우 각 center 에서 상대 center 방향으로 짧은 stub 만 늘려 방향 유지 + 시각 노이즈 최소화.
    */
   private _computeEdgeGeometry(src: PixiGraphElement, tgt: PixiGraphElement): {
     srcExit: GraphPoint; tgtEntry: GraphPoint; bbox: GraphBbox;
   } {
     const sc = src.position(), tc = tgt.position();
     const sb = src.bbox(), tb = tgt.bbox();
-    // bbox AABB 겹침이면(접점 포함) clip 시 srcExit/tgtEntry 가 뒤바뀌어 방향 반전 → center 그대로.
+    // bbox AABB 겹침이면(접점 포함) clip 시 srcExit/tgtEntry 가 뒤바뀌어 방향 반전 →
+    //   각 center 에서 상대 방향으로 stub 만 늘림. node dim 의 일부 + 두 center 거리의 절반 cap.
     const aabbOverlap = sb.x < tb.x + tb.w && tb.x < sb.x + sb.w
                      && sb.y < tb.y + tb.h && tb.y < sb.y + sb.h;
     let srcExit: GraphPoint;
     let tgtEntry: GraphPoint;
+    // edge default 에서 화살표 크기 동적 읽기 — 하드코딩 대신 (per-edge style 은 컨텍스트 없음).
+    const _rawWidth = Number(this.edgeDefaults.width ?? 1);
+    const ARROW_SIZE = Number(this.edgeDefaults.arrowSize ?? _rawWidth * 3);
     if (aabbOverlap) {
-      srcExit = { x: sc.x, y: sc.y };
-      tgtEntry = { x: tc.x, y: tc.y };
+      const tcInSb = tc.x >= sb.x && tc.x <= sb.x + sb.w && tc.y >= sb.y && tc.y <= sb.y + sb.h;
+      const scInTb = sc.x >= tb.x && sc.x <= tb.x + tb.w && sc.y >= tb.y && sc.y <= tb.y + tb.h;
+      const dx = tc.x - sc.x;
+      const dy = tc.y - sc.y;
+      const len2 = dx * dx + dy * dy;
+      const STUB = 60; // 경계 너머로 노출되는 길이 (graph units).
+      if (len2 < 1e-12) {
+        srcExit = { x: sc.x, y: sc.y };
+        tgtEntry = { x: tc.x, y: tc.y };
+      } else if (scInTb && !tcInSb) {
+        // sc 가 tb 안 (src 가 tgt 안) — sc 에서 시작, src 경계 너머 STUB 만큼.
+        const dist = Math.sqrt(len2);
+        const surface = this._clipToNode(src, sc, tc);
+        const tBdry = ((surface.x - sc.x) * dx + (surface.y - sc.y) * dy) / len2;
+        const tTgt = tBdry + STUB / dist;
+        srcExit = { x: sc.x, y: sc.y };
+        tgtEntry = { x: sc.x + dx * tTgt, y: sc.y + dy * tTgt };
+      } else if (tcInSb && !scInTb) {
+        // tc 가 sb 안 (tgt 가 src 안) — tgt = tc, srcExit 는 tgt 경계 너머 STUB.
+        //   src surface 의존 X — tc 가 어디에 있든 항상 tgt 경계 기준으로 stretching 방지.
+        const dist = Math.sqrt(len2);
+        const surface = this._clipToNode(tgt, tc, sc);
+        const tBdry = ((surface.x - sc.x) * dx + (surface.y - sc.y) * dy) / len2;
+        const tSrc = tBdry - STUB / dist;
+        srcExit = { x: sc.x + dx * tSrc, y: sc.y + dy * tSrc };
+        tgtEntry = { x: tc.x, y: tc.y };
+      } else if (tcInSb && scInTb) {
+        // 둘 다 — compact 모드, t=0.5 에 화살표 visual 중심.
+        const dist = Math.sqrt(len2);
+        const compactArrow = ARROW_SIZE * 0.6;
+        const half = (compactArrow / 2) / dist;
+        srcExit = { x: sc.x + dx * (0.5 - half), y: sc.y + dy * (0.5 - half) };
+        tgtEntry = { x: sc.x + dx * (0.5 + half), y: sc.y + dy * (0.5 + half) };
+      } else {
+        // 약간 겹침 — compact 모드, 화살표 visual 중심을 "작은 쪽 노드의 경계" 에 위치.
+        //   src/tgt 어느쪽이 작든 작은 쪽 경계가 시각적으로 명확한 overlap 경계가 됨.
+        const dist = Math.sqrt(len2);
+        const sSurf = this._clipToNode(src, sc, tc);
+        const tSurf = this._clipToNode(tgt, tc, sc);
+        const sSurfT = ((sSurf.x - sc.x) * dx + (sSurf.y - sc.y) * dy) / len2;
+        const tSurfT = ((tSurf.x - sc.x) * dx + (tSurf.y - sc.y) * dy) / len2;
+        const sArea = sb.w * sb.h;
+        const tArea = tb.w * tb.h;
+        const boundaryT = sArea <= tArea ? sSurfT : tSurfT;
+        const compactArrow = ARROW_SIZE * 0.6;
+        const half = (compactArrow / 2) / dist;
+        srcExit = { x: sc.x + dx * (boundaryT - half), y: sc.y + dy * (boundaryT - half) };
+        tgtEntry = { x: sc.x + dx * (boundaryT + half), y: sc.y + dy * (boundaryT + half) };
+      }
     } else {
-      srcExit = this._clipToNode(src, sc, tc);
-      tgtEntry = this._clipToNode(tgt, tc, sc);
+      // 비겹침 — 기본은 표면 clip 으로 full edge.
+      //   단, 두 표면 gap 이 ARROW_SIZE 보다 작으면(거의 붙음) 화살표 모드 — 두 표면 중간에 화살표.
+      const sSurf = this._clipToNode(src, sc, tc);
+      const tSurf = this._clipToNode(tgt, tc, sc);
+      const dx = tc.x - sc.x;
+      const dy = tc.y - sc.y;
+      const len2 = dx * dx + dy * dy;
+      if (len2 < 1e-12) {
+        srcExit = sSurf;
+        tgtEntry = tSurf;
+      } else {
+        const dist = Math.sqrt(len2);
+        const sSurfT = ((sSurf.x - sc.x) * dx + (sSurf.y - sc.y) * dy) / len2;
+        const tSurfT = ((tSurf.x - sc.x) * dx + (tSurf.y - sc.y) * dy) / len2;
+        const gap = (tSurfT - sSurfT) * dist;
+        if (gap < ARROW_SIZE) {
+          // 가까움 — compact 모드(화살표만 노출): segLen ≤ ARROW_SIZE 면 line 안 그리고
+          //   effArrowSize = ARROW_SIZE * 0.6 = 9.6 로 화살표만 렌더.
+          //   화살표 visual 중심 = arrowTip - effArrowSize/2 → midSurfT 에 맞추도록 양쪽으로 4.8.
+          const midT = (sSurfT + tSurfT) / 2;
+          const compactArrow = ARROW_SIZE * 0.6;
+          const half = (compactArrow / 2) / dist;
+          srcExit = { x: sc.x + dx * (midT - half), y: sc.y + dy * (midT - half) };
+          tgtEntry = { x: sc.x + dx * (midT + half), y: sc.y + dy * (midT + half) };
+        } else {
+          srcExit = sSurf;
+          tgtEntry = tSurf;
+        }
+      }
     }
     const bbox = {
       x: Math.min(srcExit.x, tgtEntry.x),
