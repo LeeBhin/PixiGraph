@@ -1649,6 +1649,9 @@ export class PixiGraph {
     const arrowShape = (s.arrowShape ?? this.edgeDefaults.arrowShape ?? 'none') as ('triangle' | 'none');
     const arrowSize = Number(s.arrowSize ?? this.edgeDefaults.arrowSize ?? rawWidth * 3);
     const lineCap = (s.lineCap ?? this.edgeDefaults.lineCap ?? 'butt') as ('butt' | 'round');
+    // start/end cap 개별 지정 — 미지정 시 lineCap 로 폴백. 한쪽만 round 가능.
+    const startCap = (s.startCap ?? s.lineCap ?? this.edgeDefaults.startCap ?? this.edgeDefaults.lineCap ?? 'butt') as ('butt' | 'round');
+    const endCap = (s.endCap ?? s.lineCap ?? this.edgeDefaults.endCap ?? this.edgeDefaults.lineCap ?? 'butt') as ('butt' | 'round');
     const lineDash = Number(s.lineDash ?? this.edgeDefaults.lineDash ?? 0);
     const lineGap = Number(s.lineGap ?? this.edgeDefaults.lineGap ?? lineDash);
     // dashOffset — per-edge style 우선, 없으면 graph 전역 offset(애니메이션용).
@@ -1656,7 +1659,8 @@ export class PixiGraph {
     const dx0 = tp.x - sp.x, dy0 = tp.y - sp.y;
     const len0 = Math.hypot(dx0, dy0);
     const hasArrow = arrowShape === 'triangle' && arrowSize > 0;
-    const isRound = lineCap === 'round';
+    const startRound = startCap === 'round';
+    const endRound = endCap === 'round';
     // parallel count 먼저 계산 → compact 판정에 필요.
     let parallelCount = 1;
     let normOffset = 0; // -1 ~ +1 (count 무관 일정)
@@ -1723,12 +1727,12 @@ export class PixiGraph {
     const tgtAwayLen = Math.hypot(tgtAwayX, tgtAwayY) || 1;
     const tux = tgtAwayX / tgtAwayLen, tuy = tgtAwayY / tgtAwayLen;
     const effArrowSize = isCompact ? scaledArrowSize * 0.6 : scaledArrowSize;
-    const startX = isRound ? sp.x + sux * halfW : sp.x;
-    const startY = isRound ? sp.y + suy * halfW : sp.y;
+    const startX = startRound ? sp.x + sux * halfW : sp.x;
+    const startY = startRound ? sp.y + suy * halfW : sp.y;
     const arrowTipX = tp.x;
     const arrowTipY = tp.y;
-    const endX = hasArrow ? arrowTipX - tux * effArrowSize : (isRound ? tp.x - tux * halfW : tp.x);
-    const endY = hasArrow ? arrowTipY - tuy * effArrowSize : (isRound ? tp.y - tuy * halfW : tp.y);
+    const endX = hasArrow ? arrowTipX - tux * effArrowSize : (endRound ? tp.x - tux * halfW : tp.x);
+    const endY = hasArrow ? arrowTipY - tuy * effArrowSize : (endRound ? tp.y - tuy * halfW : tp.y);
     if (drawLine) {
       if (lineDash > 0) {
         // dashed — 곡선은 24 sample 로 sampling 후 polyline dash.
@@ -1744,7 +1748,26 @@ export class PixiGraph {
         this._dashPolyline(g, pts, lineDash, lineGap, lineDashOffset);
       } else if (isCurve) g.moveTo(startX, startY).quadraticCurveTo(cpX, cpY, endX, endY);
       else g.moveTo(startX, startY).lineTo(endX, endY);
-      g.stroke({ color, width, alpha, cap: lineCap });
+      // PIXI stroke 의 cap 은 양 끝 공통 — start/end 가 다르면 butt 로 긋고 round 인 끝에 캡을 따로 그린다.
+      //   전체 원을 박으면 라인과 겹쳐(alpha 중첩) 진해지므로, 라인 바깥쪽 "반원" 만 그린다.
+      const symmetricCap = startRound === endRound;
+      g.stroke({ color, width, alpha, cap: symmetricCap && startRound ? 'round' : 'butt' });
+      if (!symmetricCap) {
+        if (startRound) {
+          // 시작: 라인 진행(sux) 반대쪽(뒤)으로 부푸는 반원.
+          const a = Math.atan2(suy, sux);
+          g.moveTo(startX - suy * halfW, startY + sux * halfW)
+            .arc(startX, startY, halfW, a + Math.PI / 2, a + Math.PI * 1.5)
+            .fill({ color, alpha });
+        }
+        if (endRound && !hasArrow) {
+          // 끝: 라인 진행(tux)쪽(앞)으로 부푸는 반원.
+          const b = Math.atan2(tuy, tux);
+          g.moveTo(endX + tuy * halfW, endY - tux * halfW)
+            .arc(endX, endY, halfW, b - Math.PI / 2, b + Math.PI / 2)
+            .fill({ color, alpha });
+        }
+      }
     }
     if (drawArrow) {
       const px = -tuy, py = tux;

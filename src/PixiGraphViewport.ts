@@ -27,8 +27,15 @@ import type { GraphBbox, GraphPoint } from './types';
 export interface PixiGraphViewportConfig {
   /** wheel-zoom 자동 핸들러 활성. attach(canvas) 필요. 기본 false. */
   wheel?: boolean;
-  /** wheel 한 deltaY 단위당 zoom factor 계수. 기본 0.0015. */
+  /** wheel 한 deltaY(px) 단위당 zoom factor 계수. 기본 0.0015. */
   wheelSensitivity?: number;
+  /**
+   * 이 값(정규화된 |deltaY| px) 미만이면 트랙패드로 간주해 wheelFineBoost 를 곱한다.
+   *   마우스 휠은 한 notch 당 delta 가 커서(≈100+) 영향 없음. 기본 40.
+   */
+  wheelFineThreshold?: number;
+  /** 트랙패드(작은 연속 delta)의 sensitivity 배율 — 마우스 대비 답답함 보정. 기본 3. */
+  wheelFineBoost?: number;
   /** drag-pan 자동 핸들러 활성. attach(canvas) 필요. 기본 false. */
   drag?: boolean;
   /** drag-pan 마우스 버튼. 기본 'middle'. (left 는 consumer 의 selection 과 충돌). */
@@ -94,6 +101,8 @@ export class PixiGraphViewport {
     this._cfg = {
       wheel: config?.wheel ?? false,
       wheelSensitivity: config?.wheelSensitivity ?? 0.0015,
+      wheelFineThreshold: config?.wheelFineThreshold ?? 40,
+      wheelFineBoost: config?.wheelFineBoost ?? 3,
       drag: config?.drag ?? false,
       dragButton: config?.dragButton ?? 'middle',
       dragModifier: config?.dragModifier ?? null,
@@ -171,6 +180,31 @@ export class PixiGraphViewport {
   setPan(x: number, y: number): this {
     this._world.x = x;
     this._world.y = y;
+    this._afterTransform();
+    return this;
+  }
+
+  /**
+   * 현재 viewport(host canvas) 화면 중심에 오는 graph-local(world) 좌표.
+   *   pan 은 화면-px 오프셋이라 canvas 크기가 다르면 같은 pan 이어도 중심 좌표가 달라진다.
+   *   서로 다른 크기의 뷰어 간 위치 복원은 pan 대신 이 값(+zoom)을 옮겨 centerOnWorld 로 복원.
+   */
+  get centerWorld(): GraphPoint {
+    const view = this._viewportSize();
+    const s = this._world.scale.x || 1;
+    return {
+      x: (view.w / 2 - this._world.x) / s,
+      y: (view.h / 2 - this._world.y) / s,
+    };
+  }
+
+  /** graph-local(world) 좌표를 현재 화면 중심에 오도록 pan(+선택적 zoom) 설정. tween 없음. */
+  centerOnWorld(x: number, y: number, zoom?: number): this {
+    if (zoom != null) this._world.scale.set(this._clampZoom(zoom));
+    const view = this._viewportSize();
+    const s = this._world.scale.x || 1;
+    this._world.x = view.w / 2 - x * s;
+    this._world.y = view.h / 2 - y * s;
     this._afterTransform();
     return this;
   }
@@ -402,7 +436,19 @@ export class PixiGraphViewport {
     if (!this._hostCanvas) return;
     const rect = this._hostCanvas.getBoundingClientRect();
     const anchor = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-    const factor = Math.exp(-e.deltaY * this._cfg.wheelSensitivity);
+
+    // deltaMode 정규화 → px. (Firefox 마우스휠은 LINE 단위라 값이 훨씬 작게 들어온다.)
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 16;                                          // LINE → px
+    else if (e.deltaMode === 2) dy *= this._hostCanvas.clientHeight || 800;   // PAGE → px
+
+    // 트랙패드는 이벤트당 delta 가 작아(≈2~15px) 마우스 휠(한 notch ≈100+)보다 줌이 답답하다.
+    // 임계값 미만이면 트랙패드로 보고 boost 를 곱해 체감을 맞춘다(마우스는 임계값 이상이라 영향 없음).
+    const sens = Math.abs(dy) < this._cfg.wheelFineThreshold
+      ? this._cfg.wheelSensitivity * this._cfg.wheelFineBoost
+      : this._cfg.wheelSensitivity;
+
+    const factor = Math.exp(-dy * sens);
     this.setZoom(this._world.scale.x * factor, anchor);
   }
 

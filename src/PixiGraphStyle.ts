@@ -41,6 +41,10 @@ export interface PixiGraphStyleProps {
   arrowSize?: number;
   /** 엣지 line cap — 'butt'(기본) | 'round'. 'round' 면 양 끝 둥글게(끝점 안쪽으로 width/2 끌어들여 시각 길이 유지). */
   lineCap?: 'butt' | 'round';
+  /** 엣지 시작(source)쪽 cap. 미지정 시 lineCap 사용. start/end 를 각각 지정하면 한쪽만 둥글게 가능. */
+  startCap?: 'butt' | 'round';
+  /** 엣지 끝(target)쪽 cap. 미지정 시 lineCap 사용. (화살표가 있으면 화살표 밑변이라 무시됨) */
+  endCap?: 'butt' | 'round';
   /** 엣지 dash 길이(image-local 단위). 0 = 실선(기본). */
   lineDash?: number;
   /** 엣지 gap 길이. 미지정 시 lineDash 와 동일. */
