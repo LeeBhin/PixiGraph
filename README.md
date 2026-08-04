@@ -8,6 +8,7 @@ Unlike Cytoscape, pixigraph is a pure **scene-graph library**: it renders into a
 - **Rich node shapes** — rectangles, circles, arbitrary polygons, and image/SVG-textured nodes (with automatic shape masking and a per-graph texture cache)
 - **Smart edges** — surface clipping to node geometry, parallel-edge curvature, target arrowheads, round caps, and animated dashed flow
 - **Event delegation** — Cytoscape-style `graph.on(type, selector, handler)` driven by `feed()`, with automatic `mouseover`/`mouseout` from a single `mousemove`
+- **Overlap-aware picking** — repeated taps on the same spot cycle through stacked elements (Figma-style), and a modifier key (default Alt) prefers edges over nodes; `elementsAt()` exposes the full ordered stack
 - **Selection & transform handles** — resize (corner/edge handles), rotate (dedicated handle *or* Figma-style corner ring), move, multi-select union boxes, aspect-lock, and center-resize — all per-element overridable
 - **Built-in viewport** — pan/zoom camera with wheel & drag handlers, animated `fit` / `center` / `panToElement`, and screen-stable handle/hit sizing
 - **Highlight groups** — overlay multiple named style groups on the same elements, prefix-batch removal, auto-dim of non-highlighted elements, and focus-color locking
@@ -235,6 +236,26 @@ graph.off();               // remove everything
 | `data` | `ele.data(key, value)` | the element |
 
 You only ever feed `tap`, `cxttap`, and `mousemove`; `mouseover`/`mouseout` are derived automatically. Use `graph.clearHover(native?)` to force a `mouseout` when the pointer leaves the host canvas.
+
+### Overlapping elements (picking)
+
+When elements stack (a small node inside a big one, an edge passing under a node), two built-in behaviors make every candidate reachable:
+
+- **Click cycling** *(on by default)* — tapping the same spot repeatedly cycles through the stacked candidates top → bottom (smallest node first, then larger nodes, then edges by distance), wrapping around. Tapping elsewhere resets to the top.
+- **Edge modifier** *(default `Alt`)* — holding the modifier while tapping *or hovering* flips the order so edges win over nodes. Since it also applies to hover, the `mouseover` preview shows exactly what an Alt-click would select. Pass `native` through `feed()` (as in the Quick Start) — the modifier is read from the native event.
+
+```ts
+const graph = new PixiGraph({
+  picking: {
+    cycle: true,           // repeated-tap cycling (default true)
+    edgeModifier: 'alt',   // 'alt' | 'ctrl' | 'shift' | 'meta' | null (default 'alt')
+  },
+});
+
+// Full ordered stack at a point — for your own picker UI (e.g. a candidate menu):
+graph.elementsAt(x, y);                       // top → bottom
+graph.elementsAt(x, y, { edgesFirst: true }); // edges before nodes
+```
 
 ## Selection & Transform Handles
 
@@ -479,11 +500,13 @@ graph.byClass('critical');           // elements with a class
 graph.elementsIn({ x, y, w, h });    // rubber-band box select (excludes hidden/eye-off)
 
 graph.elementAt(x, y);               // topmost element at a graph-local point
+graph.elementAt(x, y, nativeEvent);  // same, honoring the edge-preference modifier
+graph.elementsAt(x, y);              // ALL stacked elements at the point, top → bottom
 graph.nodeAt(x, y);
 graph.edgeAt(x, y);
 ```
 
-Hit testing respects real geometry (polygon outline, ellipse, rotated rect), prefers nodes over edges, and prefers the smallest overlapping node.
+Hit testing respects real geometry (polygon outline, ellipse, rotated rect), prefers nodes over edges, and prefers the smallest overlapping node. See [Overlapping elements](#overlapping-elements-picking) for cycling and modifier-based picking.
 
 ## Configuration Reference
 
@@ -493,6 +516,7 @@ new PixiGraph({
   selectionHandles?: boolean | PixiGraphHandleOptions,     // resize/rotate/move handles
   tooltip?:          boolean | PixiGraphTooltipOptions,    // hover tooltip entries
   viewport?:         boolean | PixiGraphViewportConfig,    // pan/zoom camera
+  picking?:          PixiGraphPickingOptions,              // overlap picking: { cycle, edgeModifier }
 });
 ```
 
@@ -515,7 +539,7 @@ new PixiGraph({
 `new PixiGraph(config?)` exposes:
 
 ### Elements & queries
-`add` · `remove` · `clear` · `element` · `$` · `elements` · `nodes` · `edges` · `size` · `byClass` · `elementsIn` · `elementAt` · `nodeAt` · `edgeAt` · `setHitTolerance`
+`add` · `remove` · `clear` · `element` · `$` · `elements` · `nodes` · `edges` · `size` · `byClass` · `elementsIn` · `elementAt` · `elementsAt` · `nodeAt` · `edgeAt` · `setHitTolerance`
 
 ### Styling
 `style` · `setDashOffset`
@@ -577,6 +601,7 @@ import type {
   PixiGraphBaseStyle, PixiGraphStyleProps, PixiGraphStyleRule, ParsedSelector,
   PixiGraphEventType, PixiGraphFeedType, PixiGraphEventPayload, PixiGraphHandler,
   PixiGraphHighlightInput, PixiGraphViewportConfig, PanOptions, ViewportTween,
+  PixiGraphPickingOptions,
   ElementGroup, GraphBbox, GraphPoint,
 } from '@leebhin/pixigraph';
 ```

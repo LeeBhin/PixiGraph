@@ -15,6 +15,7 @@ export type {
   PixiGraphConfig,
   PixiGraphEdgeInput,
   PixiGraphNodeInput,
+  PixiGraphPickingOptions,
 } from './types';
 export { DEFAULT_PIXIGRAPH_STYLE } from './types';
 export { StyleEngine, parseSelector, matchesSelector } from './PixiGraphStyle';

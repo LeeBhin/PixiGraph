@@ -205,6 +205,17 @@ export class PixiGraph {
    */
   private _hitTolerance = 6;
 
+  // 겹침 picking — 클릭 사이클링 + 엣지 우선 modifier (config.picking).
+  /** 같은 지점 반복 tap 시 겹친 후보 순환 선택. 기본 on. */
+  private _pickCycle = true;
+  /** 누른 채 tap/hover 하면 엣지 우선 hit 하는 modifier. null=비활성. */
+  private _edgeModifier: 'alt' | 'ctrl' | 'shift' | 'meta' | null = 'alt';
+  /** 사이클 상태 — 직전 tap 의 후보 id 목록 key / 위치 / 현재 index. */
+  private _cycleKey: string | null = null;
+  private _cycleX = 0;
+  private _cycleY = 0;
+  private _cycleIndex = 0;
+
   /** 선택 핸들(리사이즈) — 단일 노드 선택 시 bbox 둘레에 표시. 전부 옵션 커스텀. */
   private readonly handlesLayer: Container;
   private readonly handlesGfx: Graphics;
@@ -321,6 +332,13 @@ export class PixiGraph {
       }
     }
 
+    // picking 옵션 파싱 — 미지정 키는 기본값 (cycle on, edgeModifier 'alt').
+    const pk = config.picking;
+    if (pk) {
+      if (typeof pk.cycle === 'boolean') this._pickCycle = pk.cycle;
+      if (pk.edgeModifier !== undefined) this._edgeModifier = pk.edgeModifier;
+    }
+
     // 툴팁 옵션 파싱.
     const tt = config.tooltip;
     if (tt) {
@@ -346,7 +364,7 @@ export class PixiGraph {
 
     // 이벤트 위임 — graph 가 elementAt(hit-test) 만 노출. DOM 은 외부 책임.
     this.eventBus = new PixiGraphEventBus({
-      elementAt: (x, y) => this.elementAt(x, y),
+      elementAt: (x, y, native) => this.elementAt(x, y, native),
     });
 
     // 하이라이트 매니저 — 외부 시스템 (trace / 검색 / ...) 이 그룹 단위 inline style 부여.
@@ -410,6 +428,11 @@ export class PixiGraph {
    *   });
    */
   feed(type: PixiGraphFeedType, x: number, y: number, native: Event | null = null): void {
+    // tap 은 클릭 사이클링 적용 — 같은 지점 반복 tap 시 겹친 후보를 위→아래로 순환.
+    if (type === 'tap') {
+      this.eventBus.feedWithTarget('tap', this._pickTap(x, y, native), x, y, native);
+      return;
+    }
     this.eventBus.feed(type, x, y, native);
   }
 
@@ -1443,27 +1466,25 @@ export class PixiGraph {
   // ──────────────────────────────────────────────────────────
 
   /**
-   * graph-local 좌표 (x, y) 에서 가장 가까운/위에 있는 element.
+   * graph-local 좌표 (x, y) 에 겹친 모든 element — 위→아래 순.
    *
-   *  - 노드 우선 (cytoscape z-order: nodes drawn on top of edges).
-   *  - 노드: bbox 안에 점 포함. 중첩 시 가장 작은 면적 우선 (작은 노드가 위에 있다고 가정).
-   *  - 엣지: 선분 거리 ≤ stroke 반경 + 1px padding 이면 후보. 거리 가까운 것 우선.
+   *  - 기본 순서: 노드들(면적 오름차순 — 작은 노드가 위) → 엣지들(거리 오름차순).
+   *  - `edgesFirst: true` 면 엣지들이 노드들보다 앞 (edgeModifier hit 용).
+   *  - 노드: bbox/실제 기하(polygon/ellipse/회전) 안에 점 포함.
+   *  - 엣지: 선분 거리 ≤ stroke 반경 + hitTolerance 이면 후보.
    *
-   * @returns 최우선 매칭 element, 없으면 null.
+   * 겹침 UI (사이클링, 후보 목록 메뉴 등) 는 이 목록을 그대로 사용하면 된다.
    */
-  elementAt(x: number, y: number): PixiGraphElement | null {
-    let foundNode: PixiGraphElement | null = null;
-    let nodeArea = Infinity;
-    let foundEdge: PixiGraphElement | null = null;
-    let edgeDist = Infinity;
+  elementsAt(x: number, y: number, opts: { edgesFirst?: boolean } = {}): PixiGraphElement[] {
+    const nodes: { ele: PixiGraphElement; area: number }[] = [];
+    const edges: { ele: PixiGraphElement; dist: number }[] = [];
 
     this.elementMap.forEach((ele) => {
       if (ele.hasClass('unselected') || ele.hasClass('preview')) return; // 비활성/미리보기는 hit 제외
       if (ele.isNode()) {
         if (this._nodeHit(ele, x, y)) {
           const b = ele.bbox();
-          const area = Math.max(1, b.w * b.h);
-          if (area < nodeArea) { nodeArea = area; foundNode = ele; }
+          nodes.push({ ele, area: Math.max(1, b.w * b.h) });
         }
         return;
       }
@@ -1486,10 +1507,61 @@ export class PixiGraph {
       } else {
         d = distancePointSegment(x, y, s.x, s.y, t.x, t.y);
       }
-      if (d < threshold && d < edgeDist) { edgeDist = d; foundEdge = ele; }
+      if (d < threshold) edges.push({ ele, dist: d });
     });
 
-    return foundNode ?? foundEdge;
+    nodes.sort((a, b) => a.area - b.area);
+    edges.sort((a, b) => a.dist - b.dist);
+    const ns = nodes.map((n) => n.ele);
+    const es = edges.map((e) => e.ele);
+    return opts.edgesFirst ? [...es, ...ns] : [...ns, ...es];
+  }
+
+  /**
+   * graph-local 좌표 (x, y) 에서 가장 가까운/위에 있는 element.
+   *
+   *  - 노드 우선 (cytoscape z-order: nodes drawn on top of edges).
+   *  - native 를 넘기면 edgeModifier(기본 Alt) 눌림 시 엣지 우선으로 뒤집힘.
+   *
+   * @returns 최우선 매칭 element, 없으면 null.
+   */
+  elementAt(x: number, y: number, native: Event | null = null): PixiGraphElement | null {
+    return this.elementsAt(x, y, { edgesFirst: this._edgeModifierPressed(native) })[0] ?? null;
+  }
+
+  /** config.picking.edgeModifier 가 native 이벤트에서 눌려 있는지. */
+  private _edgeModifierPressed(native: Event | null): boolean {
+    if (!this._edgeModifier || !native) return false;
+    const e = native as MouseEvent;
+    switch (this._edgeModifier) {
+      case 'alt': return !!e.altKey;
+      case 'ctrl': return !!e.ctrlKey;
+      case 'shift': return !!e.shiftKey;
+      case 'meta': return !!e.metaKey;
+    }
+  }
+
+  /**
+   * tap 용 pick — 클릭 사이클링.
+   * 같은 지점(직전 tap 과 후보 목록이 같고 tol 이내)을 반복 tap 하면
+   * 겹친 후보를 위→아래로 순환. 다른 지점/후보 변화 시 최상위부터 리셋.
+   */
+  private _pickTap(x: number, y: number, native: Event | null): PixiGraphElement | null {
+    const candidates = this.elementsAt(x, y, { edgesFirst: this._edgeModifierPressed(native) });
+    if (!this._pickCycle || candidates.length <= 1) {
+      this._cycleKey = null;
+      return candidates[0] ?? null;
+    }
+    const key = candidates.map((c) => c.id()).join(' ');
+    // 같은 지점 판정 tol — hitTolerance 기반, 최소 화면 ~4px (viewScale 역보정).
+    const tol = Math.max(this._hitTolerance, 4 / (this._viewScale || 1));
+    const samePlace = this._cycleKey === key
+      && Math.hypot(x - this._cycleX, y - this._cycleY) <= tol;
+    this._cycleIndex = samePlace ? (this._cycleIndex + 1) % candidates.length : 0;
+    this._cycleKey = key;
+    this._cycleX = x;
+    this._cycleY = y;
+    return candidates[this._cycleIndex];
   }
 
   /** 엣지 hit-test 허용 거리(graph-local px) 설정. viewer 가 줌 변경 시 갱신. */
