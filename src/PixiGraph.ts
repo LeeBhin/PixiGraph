@@ -205,9 +205,11 @@ export class PixiGraph {
    */
   private _hitTolerance = 6;
 
-  // 겹침 picking — 정밀도(intent) 순 후보 + 클릭 사이클링 (config.picking).
-  /** 같은 지점 반복 tap 시 겹친 후보 순환 선택. 기본 on. */
+  // 겹침 picking — 정밀도(intent) 순 후보 + modifier 클릭 사이클링 (config.picking).
+  /** modifier+tap 시 겹친 후보 순환 선택. 기본 on. */
   private _pickCycle = true;
+  /** 순환 트리거 modifier. null=일반 반복 tap 으로 순환. 기본 'alt'. */
+  private _cycleModifier: 'alt' | 'ctrl' | 'shift' | 'meta' | null = 'alt';
   /** 사이클 상태 — 직전 tap 의 후보 id 목록 key / 위치 / 현재 index. */
   private _cycleKey: string | null = null;
   private _cycleX = 0;
@@ -330,9 +332,12 @@ export class PixiGraph {
       }
     }
 
-    // picking 옵션 파싱 — 미지정 키는 기본값 (cycle on).
+    // picking 옵션 파싱 — 미지정 키는 기본값 (cycle on, cycleModifier 'alt').
     const pk = config.picking;
-    if (pk && typeof pk.cycle === 'boolean') this._pickCycle = pk.cycle;
+    if (pk) {
+      if (typeof pk.cycle === 'boolean') this._pickCycle = pk.cycle;
+      if (pk.cycleModifier !== undefined) this._cycleModifier = pk.cycleModifier;
+    }
 
     // 툴팁 옵션 파싱.
     const tt = config.tooltip;
@@ -425,7 +430,7 @@ export class PixiGraph {
   feed(type: PixiGraphFeedType, x: number, y: number, native: Event | null = null): void {
     // tap 은 클릭 사이클링 적용 — 같은 지점 반복 tap 시 겹친 후보를 위→아래로 순환.
     if (type === 'tap') {
-      this.eventBus.feedWithTarget('tap', this._pickTap(x, y), x, y, native);
+      this.eventBus.feedWithTarget('tap', this._pickTap(x, y, native), x, y, native);
       return;
     }
     this.eventBus.feed(type, x, y, native);
@@ -1531,11 +1536,25 @@ export class PixiGraph {
   }
 
   /**
-   * tap 용 pick — 클릭 사이클링.
-   * 같은 지점(직전 tap 과 후보 목록이 같고 tol 이내)을 반복 tap 하면
-   * 겹친 후보를 정밀도 순으로 순환. 다른 지점/후보 변화 시 최상위부터 리셋.
+   * tap 용 pick — modifier 클릭 사이클링 (Figma 식 deep select).
+   *  - 일반 tap: 항상 최상위(정밀도 1순위) 후보 + 순환 리셋.
+   *  - modifier+tap: 같은 지점(후보 목록 동일 + tol 이내)이면 다음 후보로 내려감 (wrap).
+   *    새 지점에서 modifier+tap 하면 최상위 바로 아래(index 1)부터 — "그거 말고 그 밑에 것".
    */
-  private _pickTap(x: number, y: number): PixiGraphElement | null {
+  /** config.picking.cycleModifier 가 native 이벤트에서 눌려 있는지. null 이면 항상 true (반복 tap 순환). */
+  private _cycleModifierPressed(native: Event | null): boolean {
+    if (this._cycleModifier === null) return true;
+    if (!native) return false;
+    const e = native as MouseEvent;
+    switch (this._cycleModifier) {
+      case 'alt': return !!e.altKey;
+      case 'ctrl': return !!e.ctrlKey;
+      case 'shift': return !!e.shiftKey;
+      case 'meta': return !!e.metaKey;
+    }
+  }
+
+  private _pickTap(x: number, y: number, native: Event | null): PixiGraphElement | null {
     const candidates = this.elementsAt(x, y);
     if (!this._pickCycle || candidates.length <= 1) {
       this._cycleKey = null;
@@ -1546,7 +1565,12 @@ export class PixiGraph {
     const tol = Math.max(this._hitTolerance, 4 / (this._viewScale || 1));
     const samePlace = this._cycleKey === key
       && Math.hypot(x - this._cycleX, y - this._cycleY) <= tol;
-    this._cycleIndex = samePlace ? (this._cycleIndex + 1) % candidates.length : 0;
+    if (this._cycleModifierPressed(native)) {
+      // modifier+tap: 같은 지점이면 다음 후보로, 새 지점이면 최상위 바로 아래부터.
+      this._cycleIndex = samePlace ? (this._cycleIndex + 1) % candidates.length : 1;
+    } else {
+      this._cycleIndex = 0; // 일반 tap 은 항상 최상위 + 순환 리셋
+    }
     this._cycleKey = key;
     this._cycleX = x;
     this._cycleY = y;

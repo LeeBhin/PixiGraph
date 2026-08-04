@@ -177,10 +177,15 @@ export interface PixiGraphHandleOptions {
 /** Hit-test / 선택 picking 옵션 — 겹친 요소 선택 UX. */
 export interface PixiGraphPickingOptions {
   /**
-   * 같은 지점을 반복 tap 하면 겹친 후보들을 정밀도 순으로 순환 선택 (Figma 식).
-   * 기본 true. 후보가 1개 이하이거나 다른 지점을 tap 하면 순환 리셋.
+   * modifier+tap 으로 겹친 후보들을 정밀도 순으로 순환 선택 (Figma 식 deep select).
+   * 기본 true. 일반 tap 은 항상 최상위 후보 + 순환 리셋.
    */
   cycle?: boolean;
+  /**
+   * 순환에 사용할 modifier 키. 누른 채 tap 하면 같은 지점의 다음 후보로 내려감.
+   * null 이면 modifier 없이 반복 tap 만으로 순환. 기본 'alt'.
+   */
+  cycleModifier?: 'alt' | 'ctrl' | 'shift' | 'meta' | null;
 }
 
 /** Hover 툴팁 옵션 — 켜면 graph.tooltipEntries() 로 element properties 정렬 결과 제공. */

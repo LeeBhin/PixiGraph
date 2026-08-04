@@ -8,7 +8,7 @@ Unlike Cytoscape, pixigraph is a pure **scene-graph library**: it renders into a
 - **Rich node shapes** — rectangles, circles, arbitrary polygons, and image/SVG-textured nodes (with automatic shape masking and a per-graph texture cache)
 - **Smart edges** — surface clipping to node geometry, parallel-edge curvature, target arrowheads, round caps, and animated dashed flow
 - **Event delegation** — Cytoscape-style `graph.on(type, selector, handler)` driven by `feed()`, with automatic `mouseover`/`mouseout` from a single `mousemove`
-- **Intent-aware picking** — overlapping elements are ranked by targeting precision (a thin edge under the cursor beats the big node it crosses), hover and tap share the same ranking, and repeated taps cycle through the stack (Figma-style); `elementsAt()` exposes the full ordered list
+- **Intent-aware picking** — overlapping elements are ranked by targeting precision (a thin edge under the cursor beats the big node it crosses), hover and tap share the same ranking, and Alt-tap cycles deeper through the stack (Figma-style); `elementsAt()` exposes the full ordered list
 - **Selection & transform handles** — resize (corner/edge handles), rotate (dedicated handle *or* Figma-style corner ring), move, multi-select union boxes, aspect-lock, and center-resize — all per-element overridable
 - **Built-in viewport** — pan/zoom camera with wheel & drag handlers, animated `fit` / `center` / `panToElement`, and screen-stable handle/hit sizing
 - **Highlight groups** — overlay multiple named style groups on the same elements, prefix-batch removal, auto-dim of non-highlighted elements, and focus-color locking
@@ -246,11 +246,15 @@ When elements stack (a small node inside a big one, an edge passing through a no
 
 In practice: hovering a thin edge where it crosses a big node picks the **edge**; hovering a small node next to an edge picks the **node**; a small node wins over both. **Hover, `tap`, and `cxttap` all use the same ranking**, so whatever highlights on hover is exactly what a click will select.
 
-- **Click cycling** *(on by default)* — tapping the same spot repeatedly cycles through the ranked candidates, wrapping around. Tapping elsewhere resets to the top.
+- **Alt-click cycling** *(on by default)* — a plain tap always picks the top-ranked candidate. Holding the cycle modifier (default `Alt`) while tapping goes one candidate deeper each time (Figma-style deep select), wrapping around; a plain tap or tapping elsewhere resets to the top. The modifier is read from the native event you pass to `feed()`.
 
 ```ts
 const graph = new PixiGraph({
-  picking: { cycle: true },  // repeated-tap cycling (default true)
+  picking: {
+    cycle: true,            // modifier-tap cycling (default true)
+    cycleModifier: 'alt',   // 'alt' | 'ctrl' | 'shift' | 'meta' | null (default 'alt')
+                            // null = plain repeated taps cycle (no modifier needed)
+  },
 });
 
 // Full ranked stack at a point — for your own picker UI (e.g. a candidate menu):
@@ -515,7 +519,7 @@ new PixiGraph({
   selectionHandles?: boolean | PixiGraphHandleOptions,     // resize/rotate/move handles
   tooltip?:          boolean | PixiGraphTooltipOptions,    // hover tooltip entries
   viewport?:         boolean | PixiGraphViewportConfig,    // pan/zoom camera
-  picking?:          PixiGraphPickingOptions,              // overlap picking: { cycle }
+  picking?:          PixiGraphPickingOptions,              // overlap picking: { cycle, cycleModifier }
 });
 ```
 
