@@ -60,8 +60,7 @@ interface HandlerEntry {
 
 /** PixiGraph 가 element hit-test 를 위해 필요로 하는 최소 인터페이스. */
 export interface EventBusGraphHandle {
-  /** native 는 modifier 기반 picking (edgeModifier 등) 판단용 — 없으면 기본 규칙. */
-  elementAt(x: number, y: number, native?: Event | null): PixiGraphElement | null;
+  elementAt(x: number, y: number): PixiGraphElement | null;
 }
 
 export class PixiGraphEventBus {
@@ -113,7 +112,7 @@ export class PixiGraphEventBus {
    */
   feed(type: PixiGraphFeedType, x: number, y: number, native: Event | null = null): void {
     if (type === 'mousemove') {
-      const cur = this.graph.elementAt(x, y, native);
+      const cur = this.graph.elementAt(x, y);
       if (cur !== this.lastHover) {
         if (this.lastHover) this.dispatch('mouseout', this.lastHover, x, y, native);
         if (cur) this.dispatch('mouseover', cur, x, y, native);
@@ -121,7 +120,7 @@ export class PixiGraphEventBus {
       }
       return;
     }
-    const target = this.graph.elementAt(x, y, native);
+    const target = this.graph.elementAt(x, y);
     this.dispatch(type, target, x, y, native);
   }
 

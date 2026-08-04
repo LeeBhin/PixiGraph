@@ -177,15 +177,10 @@ export interface PixiGraphHandleOptions {
 /** Hit-test / 선택 picking 옵션 — 겹친 요소 선택 UX. */
 export interface PixiGraphPickingOptions {
   /**
-   * 같은 지점을 반복 tap 하면 겹친 후보들을 위→아래로 순환 선택 (Figma 식).
+   * 같은 지점을 반복 tap 하면 겹친 후보들을 정밀도 순으로 순환 선택 (Figma 식).
    * 기본 true. 후보가 1개 이하이거나 다른 지점을 tap 하면 순환 리셋.
    */
   cycle?: boolean;
-  /**
-   * 이 modifier 를 누른 채 tap/hover 하면 엣지를 노드보다 우선 hit.
-   * 노드에 가려진 엣지를 바로 집는 용도. null=비활성. 기본 'alt'.
-   */
-  edgeModifier?: 'alt' | 'ctrl' | 'shift' | 'meta' | null;
 }
 
 /** Hover 툴팁 옵션 — 켜면 graph.tooltipEntries() 로 element properties 정렬 결과 제공. */
