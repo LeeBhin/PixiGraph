@@ -40,6 +40,7 @@ import {
   type PixiGraphAddInput,
   type PixiGraphConfig,
   type PixiGraphEdgeInput,
+  type PixiGraphEdgeSplit,
   type PixiGraphNodeInput,
 } from './types';
 import { PixiGraphElement, type EdgeMeta } from './PixiGraphElement';
@@ -178,6 +179,10 @@ export class PixiGraph {
   private readonly _edgesByPair = new Map<string, Set<PixiGraphElement>>();
   /** 전역 dash offset — 흐름 시뮬 등 dash 애니메이션용. setDashOffset 으로 갱신 + 점선 엣지 재렌더. */
   private _dashOffsetGlobal = 0;
+  /** 엣지별 dash 위상 (id → 경로 누적거리) — 전역 offset 에 가산. setDashPhases 로 교체. */
+  private _dashPhases: Map<string, number> | null = null;
+  /** 엣지별 분할 렌더 (id → split) — setEdgeSplits 로 교체. 흐름 시뮬 전환 프론트 표현용. */
+  private _edgeSplits: Map<string, PixiGraphEdgeSplit> | null = null;
   /**
    * 이미지/SVG 노드용 texture 캐시 — URL → Texture 또는 로딩 중 Promise.
    *   - 같은 URL 의 노드가 여럿이면 fetch 1회만.
@@ -863,6 +868,64 @@ export class PixiGraph {
     }
   }
 
+  /**
+   * 엣지 분할 렌더 본체 — 폴리라인을 경로거리 split.at 에서 둘로 잘라 각 구간을
+   * 자기 스타일로 스트로크한다. 구간 스타일 null = 미표시(빈 배관), 미지정 필드 = base 상속.
+   * dash 구간의 패턴 위상은 전체 경로 기준으로 이어지도록 구간 시작거리를 offset 에 가산.
+   */
+  private _drawSplitEdge(
+    g: Graphics,
+    pts: GraphPoint[],
+    split: PixiGraphEdgeSplit,
+    base: { stroke: string | number; width: number; alpha: number; lineDash: number; lineGap: number; dashOffset: number },
+  ): void {
+    if (pts.length < 2) return;
+    let total = 0;
+    for (let i = 1; i < pts.length; i++) total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    const at = Math.max(0, Math.min(Number(split.at) || 0, total));
+    // at 지점에서 분할 (경계점 보간)
+    const ptsA: GraphPoint[] = [pts[0]];
+    const ptsB: GraphPoint[] = [];
+    let acc = 0;
+    let splitIdx = pts.length; // 경계 이후 첫 원본 점 index
+    for (let i = 1; i < pts.length; i++) {
+      const seg = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+      if (acc + seg >= at) {
+        const t = seg > 0 ? (at - acc) / seg : 0;
+        const bx = pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t;
+        const by = pts[i - 1].y + (pts[i].y - pts[i - 1].y) * t;
+        ptsA.push({ x: bx, y: by });
+        ptsB.push({ x: bx, y: by });
+        splitIdx = i;
+        break;
+      }
+      acc += seg;
+      ptsA.push(pts[i]);
+    }
+    for (let i = splitIdx; i < pts.length; i++) ptsB.push(pts[i]);
+
+    const drawRegion = (regionPts: GraphPoint[], ov: PixiGraphEdgeSplit['before'], startDist: number): void => {
+      if (ov === null || regionPts.length < 2) return; // null = 미표시
+      const st = ov || {};
+      const dashR = Number(st.lineDash ?? base.lineDash);
+      const gapR = Number(st.lineGap ?? (st.lineDash != null ? st.lineDash : base.lineGap));
+      if (dashR > 0) {
+        this._dashPolyline(g, regionPts, dashR, gapR, base.dashOffset + startDist);
+      } else {
+        g.moveTo(regionPts[0].x, regionPts[0].y);
+        for (let i = 1; i < regionPts.length; i++) g.lineTo(regionPts[i].x, regionPts[i].y);
+      }
+      g.stroke({
+        color: st.stroke ?? base.stroke,
+        width: Number(st.width ?? base.width),
+        alpha: Number(st.alpha ?? base.alpha),
+        cap: 'butt',
+      });
+    };
+    drawRegion(ptsA, split.before, 0);
+    drawRegion(ptsB, split.after, at);
+  }
+
   /** (x1,y1)→(x2,y2) 를 dash/gap 으로 끊어서 g 에 moveTo/lineTo 누적 (stroke 는 caller). */
   private _dashLine(g: Graphics, x1: number, y1: number, x2: number, y2: number, dash: number, gap: number): void {
     const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy);
@@ -1104,13 +1167,49 @@ export class PixiGraph {
   setDashOffset(offset: number): void {
     if (this._dashOffsetGlobal === offset) return;
     this._dashOffsetGlobal = offset;
+    this._redrawDashedEdges();
+  }
+
+  /**
+   * 엣지별 dash 위상 — id → 경로 누적거리(graph-local). 전역 dash offset 에 가산되어
+   * 연속된 엣지들의 dash 패턴이 노드를 지나도 이어져 보이게 한다 (흐름 시뮬 연속 배관 룩).
+   * null/빈 맵 = 해제. dash 엣지만 재렌더.
+   */
+  setDashPhases(phases: Map<string, number> | null): void {
+    const next = phases && phases.size > 0 ? phases : null;
+    if (this._dashPhases === next) return;
+    this._dashPhases = next;
+    this._redrawDashedEdges();
+  }
+
+  /**
+   * 엣지별 분할 렌더 — id → {@link PixiGraphEdgeSplit}. 경로 누적거리 `at` 를 경계로
+   * before/after 구간을 다른 스타일로 그린다 (null 구간 = 미표시). 흐름 시뮬레이션의
+   * "dash 생성 멈춤/시작" 프론트 — 물이 빠지거나 차오르는 경계 — 표현용.
+   * null/빈 맵 = 해제. 이전/새 맵에 있던 엣지만 재렌더.
+   */
+  setEdgeSplits(splits: Map<string, PixiGraphEdgeSplit> | null): void {
+    const next = splits && splits.size > 0 ? splits : null;
+    if (this._edgeSplits === next) return;
+    const affected = new Set<string>();
+    this._edgeSplits?.forEach((_v, id) => affected.add(id));
+    next?.forEach((_v, id) => affected.add(id));
+    this._edgeSplits = next;
+    affected.forEach((id) => {
+      const ele = this.elementMap.get(id);
+      if (ele && ele.isEdge()) this.renderElement(ele);
+    });
+  }
+
+  /** dash 스타일 엣지 일괄 재렌더 (전역 offset/위상 변경 시). */
+  private _redrawDashedEdges(): void {
     this.elementMap.forEach((ele) => {
       if (!ele.isEdge()) return;
       const eff = this.styleEngine.computeStyle(ele, this.edgeDefaults);
       const hStyle = this.highlightManager.styleFor(ele);
       const s = hStyle ? { ...eff, ...hStyle } : eff;
       const ld = Number(s.lineDash ?? this.edgeDefaults.lineDash ?? 0);
-      if (ld > 0) this.renderElement(ele);
+      if (ld > 0 || this._edgeSplits?.has(ele.id())) this.renderElement(ele);
     });
   }
 
@@ -1739,8 +1838,9 @@ export class PixiGraph {
     const endCap = (s.endCap ?? s.lineCap ?? this.edgeDefaults.endCap ?? this.edgeDefaults.lineCap ?? 'butt') as ('butt' | 'round');
     const lineDash = Number(s.lineDash ?? this.edgeDefaults.lineDash ?? 0);
     const lineGap = Number(s.lineGap ?? this.edgeDefaults.lineGap ?? lineDash);
-    // dashOffset — per-edge style 우선, 없으면 graph 전역 offset(애니메이션용).
-    const lineDashOffset = Number(s.lineDashOffset ?? this._dashOffsetGlobal);
+    // dashOffset — per-edge style 우선, 없으면 graph 전역 offset(애니메이션용) + 엣지별 위상.
+    const lineDashOffset = Number(s.lineDashOffset ?? this._dashOffsetGlobal)
+      + (this._dashPhases ? (this._dashPhases.get(ele.id()) ?? 0) : 0);
     const dx0 = tp.x - sp.x, dy0 = tp.y - sp.y;
     const len0 = Math.hypot(dx0, dy0);
     const hasArrow = arrowShape === 'triangle' && arrowSize > 0;
@@ -1818,7 +1918,20 @@ export class PixiGraph {
     const arrowTipY = tp.y;
     const endX = hasArrow ? arrowTipX - tux * effArrowSize : (endRound ? tp.x - tux * halfW : tp.x);
     const endY = hasArrow ? arrowTipY - tuy * effArrowSize : (endRound ? tp.y - tuy * halfW : tp.y);
-    if (drawLine) {
+    const edgeSplit = this._edgeSplits?.get(ele.id());
+    if (drawLine && edgeSplit) {
+      // 분할 렌더 — 경로거리 at 경계로 before/after 구간을 각자 스타일로 (캡은 butt 고정).
+      const pts: GraphPoint[] = [{ x: startX, y: startY }];
+      if (isCurve) {
+        const SAMPLES = 24;
+        for (let i = 1; i < SAMPLES; i++) {
+          const t = i / SAMPLES, u = 1 - t;
+          pts.push({ x: u * u * startX + 2 * u * t * cpX + t * t * endX, y: u * u * startY + 2 * u * t * cpY + t * t * endY });
+        }
+      }
+      pts.push({ x: endX, y: endY });
+      this._drawSplitEdge(g, pts, edgeSplit, { stroke: color, width, alpha, lineDash, lineGap, dashOffset: lineDashOffset });
+    } else if (drawLine) {
       if (lineDash > 0) {
         // dashed — 곡선은 24 sample 로 sampling 후 polyline dash.
         const pts: GraphPoint[] = [{ x: startX, y: startY }];

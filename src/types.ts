@@ -25,6 +25,29 @@ export interface GraphPoint {
   y: number;
 }
 
+/** 엣지 분할 구간의 스타일 오버라이드 — 미지정 필드는 엣지의 결정 스타일 상속. */
+export interface PixiGraphEdgeSplitStyle {
+  stroke?: string | number;
+  width?: number;
+  alpha?: number;
+  /** dash 길이. 0 = 실선. 미지정 시 엣지 스타일 상속. */
+  lineDash?: number;
+  lineGap?: number;
+}
+
+/**
+ * 엣지 분할 렌더 — {@link PixiGraph.setEdgeSplits}.
+ * 경로 누적거리 `at`(sc→tc, graph-local) 를 경계로 before([0,at]) / after([at,len]) 구간을
+ * 서로 다른 스타일로 그린다. 흐름 시뮬레이션 전환("dash 생성 멈춤/시작" — 물이 빠지거나
+ * 차오르는 프론트) 표현용. 구간 값이 null 이면 그 구간은 그리지 않는다(빈 배관).
+ * dash 구간의 패턴 위상은 전체 경로 기준으로 이어진다 (구간 시작거리를 offset 에 가산).
+ */
+export interface PixiGraphEdgeSplit {
+  at: number;
+  before?: PixiGraphEdgeSplitStyle | null;
+  after?: PixiGraphEdgeSplitStyle | null;
+}
+
 /**
  * 노드 input — `add({ nodes })` 에 넘기는 형식.
  *
