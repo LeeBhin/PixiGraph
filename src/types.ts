@@ -37,15 +37,44 @@ export interface PixiGraphEdgeSplitStyle {
 
 /**
  * 엣지 분할 렌더 — {@link PixiGraph.setEdgeSplits}.
- * 경로 누적거리 `at`(sc→tc, graph-local) 를 경계로 before([0,at]) / after([at,len]) 구간을
- * 서로 다른 스타일로 그린다. 흐름 시뮬레이션 전환("dash 생성 멈춤/시작" — 물이 빠지거나
- * 차오르는 프론트) 표현용. 구간 값이 null 이면 그 구간은 그리지 않는다(빈 배관).
+ * 경로 누적거리(sc→tc, graph-local) 경계로 엣지를 여러 구간으로 나눠 서로 다른 스타일로 그린다.
+ * 흐름 시뮬레이션 전환("dash 생성 멈춤/시작" — 물이 빠지거나 차오르는 프론트, 이동 중인
+ * 유체 덩어리) 표현용. 구간 스타일이 null 이면 그 구간은 그리지 않는다(빈 배관).
  * dash 구간의 패턴 위상은 전체 경로 기준으로 이어진다 (구간 시작거리를 offset 에 가산).
+ *
+ * 두 형태 중 하나:
+ *  - { at, before, after } — 경계 1개 (before=[0,at], after=[at,len])
+ *  - { cuts, styles } — 경계 N개 (cuts 오름차순, styles.length = cuts.length+1,
+ *    styles[i] = [cuts[i-1], cuts[i]] 구간, 마지막은 [cuts[N-1], len])
  */
 export interface PixiGraphEdgeSplit {
-  at: number;
+  at?: number;
   before?: PixiGraphEdgeSplitStyle | null;
   after?: PixiGraphEdgeSplitStyle | null;
+  cuts?: number[];
+  styles?: (PixiGraphEdgeSplitStyle | null)[];
+}
+
+/** 노드 분할 구간의 스타일 — fill/alpha 만 (wipe 용). 미지정 = 노드 결정 스타일 상속, null 구간 = 미표시. */
+export interface PixiGraphNodeSplitStyle {
+  fill?: string | number;
+  alpha?: number;
+}
+
+/**
+ * 노드 분할 렌더 — {@link PixiGraph.setNodeSplits}.
+ * 단위벡터 `dir` 방향으로 노드 모양을 반평면으로 잘라, 진행거리 `at`(모양의 dir 최소 투영점 기준)
+ * 이전(before — dir 상류쪽, 프론트가 지나간 구간)과 이후(after)를 다른 fill 로 그린다.
+ * 흐름 시뮬레이션 프론트가 노드를 통과할 때 엣지 진행 방향대로 색이 닦이듯 바뀌는 표현용.
+ */
+export interface PixiGraphNodeSplit {
+  dir: GraphPoint;
+  at?: number;
+  before?: PixiGraphNodeSplitStyle | null;
+  after?: PixiGraphNodeSplitStyle | null;
+  /** 다중 경계 — cuts 오름차순, styles.length = cuts.length+1 (엣지 split 과 동일 규칙). */
+  cuts?: number[];
+  styles?: (PixiGraphNodeSplitStyle | null)[];
 }
 
 /**

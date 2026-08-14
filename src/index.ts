@@ -17,6 +17,8 @@ export type {
   PixiGraphEdgeSplit,
   PixiGraphEdgeSplitStyle,
   PixiGraphNodeInput,
+  PixiGraphNodeSplit,
+  PixiGraphNodeSplitStyle,
   PixiGraphPickingOptions,
 } from './types';
 export { DEFAULT_PIXIGRAPH_STYLE } from './types';

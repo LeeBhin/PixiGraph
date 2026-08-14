@@ -42,6 +42,7 @@ import {
   type PixiGraphEdgeInput,
   type PixiGraphEdgeSplit,
   type PixiGraphNodeInput,
+  type PixiGraphNodeSplit,
 } from './types';
 import { PixiGraphElement, type EdgeMeta } from './PixiGraphElement';
 import {
@@ -183,6 +184,8 @@ export class PixiGraph {
   private _dashPhases: Map<string, number> | null = null;
   /** 엣지별 분할 렌더 (id → split) — setEdgeSplits 로 교체. 흐름 시뮬 전환 프론트 표현용. */
   private _edgeSplits: Map<string, PixiGraphEdgeSplit> | null = null;
+  /** 노드별 분할 렌더 (id → split) — setNodeSplits 로 교체. 프론트가 노드를 통과하는 wipe 표현용. */
+  private _nodeSplits: Map<string, PixiGraphNodeSplit> | null = null;
   /**
    * 이미지/SVG 노드용 texture 캐시 — URL → Texture 또는 로딩 중 Promise.
    *   - 같은 URL 의 노드가 여럿이면 fetch 1회만.
@@ -869,6 +872,61 @@ export class PixiGraph {
   }
 
   /**
+   * 노드 분할 렌더 본체 — 모양 폴리곤을 dir 반평면으로 잘라 before/after 를 각자 fill.
+   * at 기준점 = 모양의 dir 최소 투영점. before = 투영값 작은 쪽(프론트가 지나간 상류).
+   */
+  private _drawSplitNode(
+    g: Graphics,
+    poly: GraphPoint[],
+    split: PixiGraphNodeSplit,
+    base: { fill: string | number; alpha: number },
+  ): void {
+    if (poly.length < 3) return;
+    const dl = Math.hypot(split.dir?.x || 0, split.dir?.y || 0) || 1;
+    const ux = (split.dir?.x || 1) / dl, uy = (split.dir?.y || 0) / dl;
+    let minP = Infinity;
+    poly.forEach((p) => { minP = Math.min(minP, p.x * ux + p.y * uy); });
+    // {at,before,after} 단축형 → {cuts,styles} 정규화
+    const cutsRaw = Array.isArray(split.cuts) ? split.cuts : [Number(split.at) || 0];
+    const styles = Array.isArray(split.styles) ? split.styles : [split.before, split.after];
+    const bounds = cutsRaw.map((c) => minP + Math.max(0, Number(c) || 0));
+    // 반평면 클립 — proj 가 [lower, upper] 인 부분만 남긴다 (Sutherland–Hodgman 2회)
+    const clipBand = (lower: number, upper: number): GraphPoint[] => {
+      let cur = poly;
+      const clipOne = (pts: GraphPoint[], boundary: number, sign: number): GraphPoint[] => {
+        const out: GraphPoint[] = [];
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i]; const c = pts[(i + 1) % pts.length];
+          const da = (boundary - (a.x * ux + a.y * uy)) * sign;
+          const dc = (boundary - (c.x * ux + c.y * uy)) * sign;
+          if (da >= 0) out.push(a);
+          if ((da >= 0) !== (dc >= 0)) {
+            const t = da / (da - dc);
+            out.push({ x: a.x + (c.x - a.x) * t, y: a.y + (c.y - a.y) * t });
+          }
+        }
+        return out;
+      };
+      if (upper !== Infinity) cur = clipOne(cur, upper, 1);   // proj <= upper
+      if (lower !== -Infinity && cur.length >= 3) cur = clipOne(cur, lower, -1); // proj >= lower
+      return cur;
+    };
+    const drawPart = (pts: GraphPoint[], ov: PixiGraphNodeSplit['before']): void => {
+      if (ov === null || pts.length < 3) return;
+      const st = ov || {};
+      const flatPts: number[] = [];
+      pts.forEach((p) => { flatPts.push(p.x, p.y); });
+      g.poly(flatPts);
+      g.fill({ color: st.fill ?? base.fill, alpha: Number(st.alpha ?? base.alpha) });
+    };
+    for (let i = 0; i < styles.length; i++) {
+      const lower = i === 0 ? -Infinity : bounds[i - 1];
+      const upper = i === styles.length - 1 ? Infinity : bounds[i];
+      drawPart(clipBand(lower, upper), styles[i]);
+    }
+  }
+
+  /**
    * 엣지 분할 렌더 본체 — 폴리라인을 경로거리 split.at 에서 둘로 잘라 각 구간을
    * 자기 스타일로 스트로크한다. 구간 스타일 null = 미표시(빈 배관), 미지정 필드 = base 상속.
    * dash 구간의 패턴 위상은 전체 경로 기준으로 이어지도록 구간 시작거리를 offset 에 가산.
@@ -882,27 +940,10 @@ export class PixiGraph {
     if (pts.length < 2) return;
     let total = 0;
     for (let i = 1; i < pts.length; i++) total += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-    const at = Math.max(0, Math.min(Number(split.at) || 0, total));
-    // at 지점에서 분할 (경계점 보간)
-    const ptsA: GraphPoint[] = [pts[0]];
-    const ptsB: GraphPoint[] = [];
-    let acc = 0;
-    let splitIdx = pts.length; // 경계 이후 첫 원본 점 index
-    for (let i = 1; i < pts.length; i++) {
-      const seg = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-      if (acc + seg >= at) {
-        const t = seg > 0 ? (at - acc) / seg : 0;
-        const bx = pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t;
-        const by = pts[i - 1].y + (pts[i].y - pts[i - 1].y) * t;
-        ptsA.push({ x: bx, y: by });
-        ptsB.push({ x: bx, y: by });
-        splitIdx = i;
-        break;
-      }
-      acc += seg;
-      ptsA.push(pts[i]);
-    }
-    for (let i = splitIdx; i < pts.length; i++) ptsB.push(pts[i]);
+    // {at,before,after} 단축형 → {cuts,styles} 정규화
+    const cutsRaw = Array.isArray(split.cuts) ? split.cuts : [Number(split.at) || 0];
+    const styles = Array.isArray(split.styles) ? split.styles : [split.before, split.after];
+    const cuts = cutsRaw.map((c) => Math.max(0, Math.min(Number(c) || 0, total)));
 
     const drawRegion = (regionPts: GraphPoint[], ov: PixiGraphEdgeSplit['before'], startDist: number): void => {
       if (ov === null || regionPts.length < 2) return; // null = 미표시
@@ -922,8 +963,48 @@ export class PixiGraph {
         cap: 'butt',
       });
     };
-    drawRegion(ptsA, split.before, 0);
-    drawRegion(ptsB, split.after, at);
+
+    // 경계들을 따라 폴리라인을 순차 분할하며 구간별로 그린다
+    let regionPts: GraphPoint[] = [pts[0]];
+    let acc = 0;               // 지금까지 소비한 경로 길이
+    let cutIdx = 0;            // 다음 경계
+    let regionStart = 0;       // 현재 구간의 시작 경로거리
+    let i = 1;
+    let prev = pts[0];
+    let segRemain = 0;         // 현재 세그먼트에서 남은 길이
+    let segEnd = pts[0];
+    const nextSeg = () => {
+      segEnd = pts[i];
+      segRemain = Math.hypot(segEnd.x - prev.x, segEnd.y - prev.y);
+      i++;
+    };
+    nextSeg();
+    for (;;) {
+      const nextCut = cutIdx < cuts.length ? cuts[cutIdx] : Infinity;
+      if (acc + segRemain >= nextCut) {
+        // 이 세그먼트 안에 경계 — 경계점 보간, 구간 마감
+        const need = nextCut - acc;
+        const t = segRemain > 0 ? need / segRemain : 0;
+        const bx = prev.x + (segEnd.x - prev.x) * t;
+        const by = prev.y + (segEnd.y - prev.y) * t;
+        regionPts.push({ x: bx, y: by });
+        drawRegion(regionPts, styles[cutIdx], regionStart);
+        regionPts = [{ x: bx, y: by }];
+        regionStart = nextCut;
+        prev = { x: bx, y: by };
+        segRemain -= need;
+        acc = nextCut;
+        cutIdx++;
+        continue;
+      }
+      // 세그먼트 소비
+      acc += segRemain;
+      regionPts.push(segEnd);
+      prev = segEnd;
+      if (i >= pts.length) break;
+      nextSeg();
+    }
+    drawRegion(regionPts, styles[cutIdx], regionStart);
   }
 
   /** (x1,y1)→(x2,y2) 를 dash/gap 으로 끊어서 g 에 moveTo/lineTo 누적 (stroke 는 caller). */
@@ -1198,6 +1279,24 @@ export class PixiGraph {
     affected.forEach((id) => {
       const ele = this.elementMap.get(id);
       if (ele && ele.isEdge()) this.renderElement(ele);
+    });
+  }
+
+  /**
+   * 노드별 분할 렌더 — id → {@link PixiGraphNodeSplit}. dir 방향 진행거리 `at` 를 경계로
+   * 노드 fill 을 두 구간으로 나눠 그린다 (null 구간 = 미표시). 흐름 시뮬 프론트가 노드를
+   * 엣지 진행 방향대로 통과하는 wipe 표현용. null/빈 맵 = 해제.
+   */
+  setNodeSplits(splits: Map<string, PixiGraphNodeSplit> | null): void {
+    const next = splits && splits.size > 0 ? splits : null;
+    if (this._nodeSplits === next) return;
+    const affected = new Set<string>();
+    this._nodeSplits?.forEach((_v, id) => affected.add(id));
+    next?.forEach((_v, id) => affected.add(id));
+    this._nodeSplits = next;
+    affected.forEach((id) => {
+      const ele = this.elementMap.get(id);
+      if (ele && ele.isNode()) this.renderElement(ele);
     });
   }
 
@@ -1798,6 +1897,29 @@ export class PixiGraph {
       // 모양 디스패치(node_type): polygon → poly(polygonPoints), circle → 타원, 그 외 rect.
       const shape = this._nodeShape(ele);
       const flat = shape === 'polygon' ? this._nodePolygonPoints(ele) : null;
+      // 분할 wipe — 이미지 없는 노드만 (이미지 노드는 통짜 렌더 유지)
+      const nodeSplit = this._nodeSplits?.get(ele.id());
+      if (nodeSplit && !ele.image()) {
+        let poly: GraphPoint[];
+        if (flat) {
+          poly = [];
+          for (let i = 0; i + 1 < flat.length; i += 2) poly.push({ x: flat[i], y: flat[i + 1] });
+        } else if (shape === 'circle') {
+          poly = [];
+          const N = 32;
+          for (let i = 0; i < N; i++) {
+            const a = (i / N) * Math.PI * 2;
+            poly.push({ x: cx + Math.cos(a) * b.w / 2, y: cy + Math.sin(a) * b.h / 2 });
+          }
+        } else {
+          poly = [{ x: b.x, y: b.y }, { x: b.x + b.w, y: b.y }, { x: b.x + b.w, y: b.y + b.h }, { x: b.x, y: b.y + b.h }];
+        }
+        this._drawSplitNode(g, poly, nodeSplit, {
+          fill: s.fill ?? this.nodeDefaults.fill ?? 0x000000,
+          alpha: s.alpha ?? this.nodeDefaults.alpha ?? 1,
+        });
+        return;
+      }
       if (flat) g.poly(flat);
       else if (shape === 'circle') g.ellipse(cx, cy, b.w / 2, b.h / 2);
       else g.rect(b.x, b.y, b.w, b.h);
