@@ -1,0 +1,26 @@
+# npm 배포 — v* 태그를 푸시하면 GitHub Actions 가 OIDC(trusted publishing)로 npm 에 올린다.
+# 토큰·OTP 없이 동작한다. npmjs.com 패키지 설정의 Trusted Publisher 에
+# (LeeBhin / PixiGraph / publish.yml) 가 등록돼 있어야 한다.
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write   # OIDC — npm trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24   # npm 11.5.1+ 필요(trusted publishing)
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      # 태그와 package.json 버전이 다르면 멈춘다 — 엉뚱한 버전이 올라가지 않게.
+      - run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm publish
