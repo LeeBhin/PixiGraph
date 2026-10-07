@@ -40,6 +40,10 @@ export interface ElementGraphHandle {
    * PixiGraph 가 구현 (C 단계). 미구현 graph 라면 옵셔널이라 호출 safe.
    */
   _restyleElement?(ele: PixiGraphElement): void;
+  /** 상태(classes/selected)만 바뀐 재렌더 — 모양이 같고 alpha 만 바뀌면 graph 가 다시 그리지 않는다. */
+  _restyleState?(ele: PixiGraphElement): void;
+  /** 노드 id 에 연결된 엣지 — graph 가 인접 색인을 가지면 전 엣지를 거르지 않는다. */
+  _edgesOf?(nodeId: string): PixiGraphElement[];
   /**
    * 선택 상태 변경 통지 — select()/unselect() 시 element 가 호출.
    * PixiGraph 가 'select'/'unselect' 이벤트로 발행 → 외부(React) 구독 가능.
@@ -227,7 +231,7 @@ export class PixiGraphElement {
     if (!cls) return this;
     const changed = !this._classes.has(cls);
     this._classes.add(cls);
-    if (changed) this._graph._restyleElement?.(this);
+    if (changed) this._restyleState();
     return this;
   }
 
@@ -235,7 +239,7 @@ export class PixiGraphElement {
   removeClass(cls: string): this {
     if (!cls) return this;
     const changed = this._classes.delete(cls);
-    if (changed) this._graph._restyleElement?.(this);
+    if (changed) this._restyleState();
     return this;
   }
 
@@ -244,7 +248,7 @@ export class PixiGraphElement {
     if (!cls) return this;
     if (this._classes.has(cls)) this._classes.delete(cls);
     else this._classes.add(cls);
-    this._graph._restyleElement?.(this);
+    this._restyleState();
     return this;
   }
 
@@ -264,7 +268,7 @@ export class PixiGraphElement {
   select(): this {
     if (!this._selected) {
       this._selected = true;
-      this._graph._restyleElement?.(this);
+      this._restyleState();
       this._graph._emitSelectionChange?.(this, true);
     }
     return this;
@@ -274,7 +278,7 @@ export class PixiGraphElement {
   unselect(): this {
     if (this._selected) {
       this._selected = false;
-      this._graph._restyleElement?.(this);
+      this._restyleState();
       this._graph._emitSelectionChange?.(this, false);
     }
     return this;
@@ -283,12 +287,23 @@ export class PixiGraphElement {
   /** selected 여부. */
   selected(): boolean { return this._selected; }
 
+  /** 상태 변경 재렌더 통지 — graph 가 상태 전용 경로를 지원하면 그쪽, 아니면 일반 재렌더. */
+  private _restyleState(): void {
+    if (this._graph._restyleState) this._graph._restyleState(this);
+    else this._graph._restyleElement?.(this);
+  }
+
   /** 이 element 가 속한 highlight 그룹 id 들 (read-only snapshot). */
   highlights(): string[] { return [...this._highlightGroupIds]; }
   /** 특정 highlight 그룹 속함 여부. */
   hasHighlight(id: string): boolean { return this._highlightGroupIds.has(id); }
 
   // ── 그래프 탐색 ─────────────────────────────────────────
+
+  /** edge 전용 — 끝점 노드 id(노드 등록 여부와 무관). node 면 null. */
+  edgeEndpointIds(): { source: string; target: string } | null {
+    return this._edgeMeta ? { source: this._edgeMeta.srcId, target: this._edgeMeta.tgtId } : null;
+  }
 
   /** edge 전용 — src 노드 element. node 또는 src 노드 미등록이면 null. */
   source(): PixiGraphElement | null {
@@ -315,6 +330,7 @@ export class PixiGraphElement {
   /** node 전용 — 이 노드를 src 또는 tgt 로 가지는 모든 edge. */
   connectedEdges(): PixiGraphElement[] {
     if (!this.isNode()) return [];
+    if (this._graph._edgesOf) return this._graph._edgesOf(this._id);
     return this._graph.edges().filter((e) => {
       const src = e.source(); const tgt = e.target();
       return src?.id() === this._id || tgt?.id() === this._id;

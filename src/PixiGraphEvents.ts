@@ -30,6 +30,8 @@ import type { PixiGraphElement } from './PixiGraphElement';
 export type PixiGraphEventType =
   | 'tap' | 'cxttap' | 'mouseover' | 'mouseout'
   | 'select' | 'unselect'
+  /** 선택 집합이 바뀜 — 한 틱의 select/unselect 를 묶어 한 번, target null. */
+  | 'selectionchange'
   | 'add' | 'remove'
   | 'bbox' | 'rotation' | 'polygon' | 'data';
 
@@ -141,7 +143,7 @@ export class PixiGraphEventBus {
    * 상태변경 이벤트(select/unselect) 직접 발행 — hit-test/좌표 없음.
    * graph 가 element 선택 상태 변경 시 호출. selector 매칭은 dispatch 가 처리.
    */
-  emit(type: PixiGraphEventType, target: PixiGraphElement, native: Event | null = null): void {
+  emit(type: PixiGraphEventType, target: PixiGraphElement | null, native: Event | null = null): void {
     this.dispatch(type, target, 0, 0, native);
   }
 

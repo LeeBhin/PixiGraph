@@ -231,11 +231,16 @@ graph.off();               // remove everything
 | `mouseover` | auto, from `feed('mousemove', …)` | always non-null |
 | `mouseout` | auto, when hover leaves an element | always non-null |
 | `select` / `unselect` | selection state changes | the element |
+| `selectionchange` | selection set changed — once per tick, after any number of `select`/`unselect` | `null` |
 | `add` / `remove` | element added / removed | the element |
 | `bbox` / `rotation` / `polygon` | node geometry changes | the element |
 | `data` | `ele.data(key, value)` | the element |
 
 You only ever feed `tap`, `cxttap`, and `mousemove`; `mouseover`/`mouseout` are derived automatically. Use `graph.clearHover(native?)` to force a `mouseout` when the pointer leaves the host canvas.
+
+If a handler re-reads the whole selection (`graph.selected()`), subscribe to `selectionchange` instead of `select`/`unselect` — a rubber-band selection of 500 elements then runs it once, not 500 times.
+
+**Batched state rendering.** Class, selection and highlight changes (`addClass`, `select`, `highlight`, `hidden(…)` …) are drawn once per element in a microtask, so bulk changes cost one redraw each and still land in the same frame. When only `alpha` toggles between 0 and the last drawn value (hidden mode, highlight dim) the element is shown/hidden without rebuilding its geometry. Hit tests flush pending work first; call `graph.flush()` if you need the drawn result synchronously.
 
 ### Overlapping elements (picking)
 
@@ -509,7 +514,7 @@ graph.nodeAt(x, y);
 graph.edgeAt(x, y);
 ```
 
-Hit testing respects real geometry (polygon outline, ellipse, rotated rect). Overlapping candidates are ranked by targeting precision — see [Overlapping elements](#overlapping-elements-picking) for the heuristic and click cycling.
+Hit testing respects real geometry (polygon outline, ellipse, rotated rect) and uses a uniform-grid spatial index, updated incrementally as elements move. Overlapping candidates are ranked by targeting precision — see [Overlapping elements](#overlapping-elements-picking) for the heuristic and click cycling.
 
 ## Configuration Reference
 
@@ -548,7 +553,7 @@ new PixiGraph({
 `style` · `setDashOffset`
 
 ### Events
-`on` · `off` · `feed` · `clearHover`
+`on` · `off` · `feed` · `clearHover` · `flush`
 
 ### Selection & handles
 `select` · `unselect` · `unselectAll` · `selected` · `setSelectionHandles` · `redrawHandles` · `setViewScale` · `selectionBbox` · `resizableSelected` · `rotatableSelected` · `movableSelected` · `handlePositions` · `handleAt` · `rotateZoneAt`

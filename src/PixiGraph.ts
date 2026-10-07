@@ -62,6 +62,7 @@ import { ptSegDist, projectOnSeg } from './PixiGraphGeometry';
 import { PixiGraphPreview } from './PixiGraphPreview';
 import { PixiGraphHistory } from './PixiGraphHistory';
 import { PixiGraphViewport, type PixiGraphViewportConfig, type PanOptions } from './PixiGraphViewport';
+import { SpatialGrid, type SpatialItem } from './PixiGraphSpatial';
 
 /**
  * 점 (px, py) 에서 선분 (x1,y1)→(x2,y2) 까지 최단거리.
@@ -212,6 +213,36 @@ export class PixiGraph {
    * 줌과 무관하게 일정한 화면 hit 영역 확보. 기본은 넉넉히 6.
    */
   private _hitTolerance = 6;
+
+  // ── 상태 변경 일괄 반영 ──
+  //   class/select/highlight 변경은 즉시 그리지 않고 모았다가 microtask 에 element 당 한 번만 그린다.
+  //   러버밴드 500개 선택·하이라이트 on/off·hidden 토글처럼 한 번에 수백~수천 개가 바뀌어도
+  //   그리기·핸들·selectionchange 가 각각 한 번. microtask 라 같은 프레임 안에 반영된다.
+  /** 다시 그릴 element → true=전체 렌더, false=상태만(alpha 0↔원래 값이면 그리지 않음). */
+  private readonly _pending = new Map<PixiGraphElement, boolean>();
+  private _flushScheduled = false;
+  private _handlesDirty = false;
+  private _selectionDirty = false;
+  /** 선택된 element — selected() 가 전수 순회하지 않게. */
+  private readonly _selectedSet = new Set<PixiGraphElement>();
+  /** element 등록 순서 — selected()·hit 후보를 종전(elementMap 순회)과 같은 순서로 돌려주려고. */
+  private readonly _seq = new WeakMap<PixiGraphElement, number>();
+  private _seqCounter = 0;
+  /** 마지막 전체 렌더의 effective style 과 alpha — 상태 변경이 alpha 만 0 으로/원래로면 재렌더 생략. */
+  private readonly _renderMeta = new WeakMap<PixiGraphElement, { style: PixiGraphStyleProps; alpha: number }>();
+  /** dash 또는 분할 렌더 중인 엣지 — dash offset/위상 변경 시 이것만 다시 그린다. */
+  private readonly _dashedEdges = new Set<PixiGraphElement>();
+  /** hit-test 공간 인덱스 — null 이면 다음 질의 때 통째로 만든다. */
+  private _spatial: SpatialGrid | null = null;
+  /** 인덱스 이후 기하가 바뀐 element — 다음 질의 때 이것만 다시 넣는다. */
+  private readonly _spatialDirty = new Set<PixiGraphElement>();
+  /** 인덱스를 만들 때의 최대 엣지 폭 — 질의 영역 여유(엣지 hit 폭 + tolerance). */
+  private _maxEdgeWidth = 1;
+  /**
+   * 노드 id → 연결 엣지(추가 순) — connectedEdges() 가 전 엣지를 거르지 않게. 노드 드래그는 매 프레임
+   * 연결 엣지를 찾으므로 여기서 O(E) 가 빠진다. 엣지 끝점은 생성 후 바뀌지 않아 추가/제거 때만 갱신.
+   */
+  private readonly _edgesByNode = new Map<string, Set<PixiGraphElement>>();
 
   // 겹침 picking — 정밀도(intent) 순 후보 + modifier 클릭 사이클링 (config.picking).
   /** modifier+tap 시 겹친 후보 순환 선택. 기본 on. */
@@ -490,6 +521,8 @@ export class PixiGraph {
       graph: this,
     });
     this.elementMap.set(input.id, ele);
+    this._seq.set(ele, this._seqCounter++);
+    this._spatialDirty.add(ele);
     // 모양/기하 — 1급 속성으로 설정(라이브러리는 도메인 데이터 안 봄).
     if (input.shape) ele.shape(input.shape);
     if (input.polygonPoints) ele.polygonPoints(input.polygonPoints);
@@ -530,11 +563,18 @@ export class PixiGraph {
       edgeMeta,
     });
     this.elementMap.set(input.id, ele);
+    this._seq.set(ele, this._seqCounter++);
+    this._spatialDirty.add(ele);
     // pair 인덱스 등록 — 양방향 같은 키 사용.
     const pk = this._pairKey(input.source, input.target);
     let set = this._edgesByPair.get(pk);
     if (!set) { set = new Set(); this._edgesByPair.set(pk, set); }
     set.add(ele);
+    for (const nid of [input.source, input.target]) {
+      let adj = this._edgesByNode.get(nid);
+      if (!adj) { adj = new Set(); this._edgesByNode.set(nid, adj); }
+      adj.add(ele);
+    }
     // hidden / dim 클래스 상속 — class add 가 renderElement 자동 트리거.
     if (this._hidden) ele.addClass('hidden');
     if (this.highlightManager.isAnyActive()) ele.addClass('dim');
@@ -566,10 +606,22 @@ export class PixiGraph {
         const set = this._edgesByPair.get(this._pairKey(src.id(), tgt.id()));
         if (set) { set.delete(ele); if (set.size === 0) this._edgesByPair.delete(this._pairKey(src.id(), tgt.id())); }
       }
+      const meta = ele.edgeEndpointIds();
+      if (meta) {
+        for (const nid of [meta.source, meta.target]) {
+          const adj = this._edgesByNode.get(nid);
+          if (adj) { adj.delete(ele); if (adj.size === 0) this._edgesByNode.delete(nid); }
+        }
+      }
     }
     this.highlightManager._onElementRemoved(ele);
     try { ele.view.destroy(); } catch { /* noop */ }
     this.elementMap.delete(id);
+    this._selectedSet.delete(ele);
+    this._dashedEdges.delete(ele);
+    this._pending.delete(ele);
+    this._spatialDirty.delete(ele);
+    this._spatial?.remove(ele);
     parallels.forEach((e) => this.renderElement(e));
   }
 
@@ -589,6 +641,12 @@ export class PixiGraph {
     });
     this.elementMap.clear();
     this._edgesByPair.clear();
+    this._edgesByNode.clear();
+    this._selectedSet.clear();
+    this._dashedEdges.clear();
+    this._pending.clear();
+    this._spatial = null;
+    this._spatialDirty.clear();
     // 모든 element 가 사라졌으므로 그룹들도 다 빈 상태 — 정리.
     this.highlightManager.clear();
     this._renderHandles(); // 선택 사라짐 → 핸들 제거
@@ -721,15 +779,23 @@ export class PixiGraph {
 
   /** 현재 selected element 목록. cytoscape `cy.elements(':selected')` 와 동등. */
   selected(): PixiGraphElement[] {
-    const out: PixiGraphElement[] = [];
-    this.elementMap.forEach((e) => { if (e.selected()) out.push(e); });
+    const out = [...this._selectedSet];
+    out.sort((a, b) => (this._seq.get(a) ?? 0) - (this._seq.get(b) ?? 0));
     return out;
   }
 
-  /** 선택 상태 변경 통지 (ElementGraphHandle) — 'select'/'unselect' 이벤트 발행 + 핸들 갱신. */
+  /**
+   * 선택 상태 변경 통지 (ElementGraphHandle) — 'select'/'unselect' 이벤트는 element 마다 즉시 발행(호환),
+   * 핸들 그리기와 'selectionchange'(target null) 는 microtask 에 한 번. 선택 집합 전체를 다시 계산하는
+   * 구독자는 selectionchange 를 쓰면 다중 선택에서도 한 번만 돈다.
+   */
   _emitSelectionChange(ele: PixiGraphElement, selected: boolean): void {
+    if (selected) this._selectedSet.add(ele);
+    else this._selectedSet.delete(ele);
     this.eventBus.emit(selected ? 'select' : 'unselect', ele);
-    this._renderHandles();
+    this._handlesDirty = true;
+    this._selectionDirty = true;
+    this._schedule();
   }
 
   /** data(key, value) 변경 통지 (ElementGraphHandle) — 'data' 이벤트 발행. key/value 는 native 에 wrap. */
@@ -1300,15 +1366,18 @@ export class PixiGraph {
     });
   }
 
+  /** 노드 id 에 연결된 엣지(추가 순) — PixiGraphElement.connectedEdges 가 쓴다. */
+  _edgesOf(nodeId: string): PixiGraphElement[] {
+    const adj = this._edgesByNode.get(nodeId);
+    return adj ? [...adj] : [];
+  }
+
   /** dash 스타일 엣지 일괄 재렌더 (전역 offset/위상 변경 시). */
   private _redrawDashedEdges(): void {
-    this.elementMap.forEach((ele) => {
-      if (!ele.isEdge()) return;
-      const eff = this.styleEngine.computeStyle(ele, this.edgeDefaults);
-      const hStyle = this.highlightManager.styleFor(ele);
-      const s = hStyle ? { ...eff, ...hStyle } : eff;
-      const ld = Number(s.lineDash ?? this.edgeDefaults.lineDash ?? 0);
-      if (ld > 0 || this._edgeSplits?.has(ele.id())) this.renderElement(ele);
+    // 쌓인 상태 변경부터 반영 — dash 가 새로 붙거나 떨어진 엣지가 _dashedEdges 에 맞게.
+    this._flushRenders();
+    [...this._dashedEdges].forEach((ele) => {
+      if (this.elementMap.get(ele.id()) === ele) this.renderElement(ele);
     });
   }
 
@@ -1328,7 +1397,8 @@ export class PixiGraph {
     const { nodes = true, edges = true } = opts;
     const x2 = rect.x + rect.w, y2 = rect.y + rect.h;
     const out: PixiGraphElement[] = [];
-    this.elementMap.forEach((ele) => {
+    this._flushRenders();
+    this._spatialIndex().query(rect.x, rect.y, x2, y2).forEach((ele) => {
       if (ele.hasClass('unselected') || ele.hasClass('hidden')) return;
       if (ele.isNode() ? !nodes : !edges) return;
       const b = ele.bbox();
@@ -1679,7 +1749,7 @@ export class PixiGraph {
   elementsAt(x: number, y: number): PixiGraphElement[] {
     const hits: { ele: PixiGraphElement; score: number; dist: number }[] = [];
 
-    this.elementMap.forEach((ele) => {
+    this._candidatesNear(x, y).forEach((ele) => {
       if (ele.hasClass('unselected') || ele.hasClass('preview')) return; // 비활성/미리보기는 hit 제외
       if (ele.isNode()) {
         if (this._nodeHit(ele, x, y)) {
@@ -1775,6 +1845,68 @@ export class PixiGraph {
     return candidates[this._cycleIndex];
   }
 
+  /**
+   * hit-test 공간 인덱스 — 없으면 지금 element 기하로 만든다. 노드는 bbox(회전 시 외접 영역),
+   * 엣지는 끝점·렌더된 곡선 샘플·bbox 를 모두 덮는 영역.
+   */
+  private _spatialIndex(): SpatialGrid {
+    const dirty = this._spatialDirty;
+    // 처음이거나 많이 바뀌었으면(초기 로드·style 일괄 등) 통째로, 아니면 바뀐 것만 다시 넣는다.
+    if (!this._spatial || dirty.size > Math.max(64, this._spatial.size / 4)) {
+      const items: SpatialItem[] = [];
+      this._maxEdgeWidth = 1;
+      this.elementMap.forEach((ele) => items.push(this._spatialItem(ele)));
+      this._spatial = new SpatialGrid(items);
+      dirty.clear();
+      return this._spatial;
+    }
+    if (dirty.size) {
+      const grid = this._spatial;
+      dirty.forEach((ele) => {
+        grid.remove(ele);
+        if (this.elementMap.get(ele.id()) === ele) grid.insert(this._spatialItem(ele));
+      });
+      dirty.clear();
+    }
+    return this._spatial;
+  }
+
+  /** element 의 색인 영역 — 엣지면 최대 폭(질의 여유)도 갱신한다(늘기만 — 여유가 넉넉해도 결과는 같다). */
+  private _spatialItem(ele: PixiGraphElement): SpatialItem {
+    const seq = this._seq.get(ele) ?? 0;
+    const b = ele.bbox();
+    let x1 = b.x, y1 = b.y, x2 = b.x + b.w, y2 = b.y + b.h;
+    if (ele.isNode()) {
+      if (ele.rotation()) {
+        const cx = b.x + b.w / 2, cy = b.y + b.h / 2, r = Math.hypot(b.w, b.h) / 2;
+        x1 = cx - r; y1 = cy - r; x2 = cx + r; y2 = cy + r;
+      }
+    } else {
+      const eff = this.styleEngine.computeStyle(ele, this.edgeDefaults);
+      const w = Number(eff.width ?? this.edgeDefaults.width ?? 1);
+      if (w > this._maxEdgeWidth) this._maxEdgeWidth = w;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const curve = (ele as any)._renderedCurve as GraphPoint[] | undefined;
+      const pts = [ele.sourcePoint(), ele.targetPoint(), ...(curve ?? [])];
+      for (const pt of pts) {
+        if (!pt) continue;
+        if (pt.x < x1) x1 = pt.x;
+        if (pt.y < y1) y1 = pt.y;
+        if (pt.x > x2) x2 = pt.x;
+        if (pt.y > y2) y2 = pt.y;
+      }
+    }
+    return { ele, seq, x1, y1, x2, y2 };
+  }
+
+  /** (x, y) 근처 hit 후보 — 엣지 최대 hit 폭(폭 + tolerance)만큼 넓힌 영역의 element, 등록 순. */
+  private _candidatesNear(x: number, y: number): PixiGraphElement[] {
+    this._flushRenders();
+    const grid = this._spatialIndex();
+    const pad = this._maxEdgeWidth + this._hitTolerance;
+    return grid.query(x - pad, y - pad, x + pad, y + pad);
+  }
+
   /** 엣지 hit-test 허용 거리(graph-local px) 설정. viewer 가 줌 변경 시 갱신. */
   setHitTolerance(px: number): void {
     if (Number.isFinite(px) && px >= 0) this._hitTolerance = px;
@@ -1784,7 +1916,7 @@ export class PixiGraph {
   nodeAt(x: number, y: number): PixiGraphElement | null {
     let found: PixiGraphElement | null = null;
     let bestArea = Infinity;
-    this.elementMap.forEach((ele) => {
+    this._candidatesNear(x, y).forEach((ele) => {
       if (!ele.isNode() || ele.hasClass('unselected') || ele.hasClass('preview')) return;
       if (this._nodeHit(ele, x, y)) {
         const b = ele.bbox();
@@ -1799,7 +1931,7 @@ export class PixiGraph {
   edgeAt(x: number, y: number): PixiGraphElement | null {
     let found: PixiGraphElement | null = null;
     let bestDist = Infinity;
-    this.elementMap.forEach((ele) => {
+    this._candidatesNear(x, y).forEach((ele) => {
       if (!ele.isEdge() || ele.hasClass('unselected') || ele.hasClass('preview')) return;
       const s = ele.sourcePoint(); const t = ele.targetPoint();
       if (!s || !t) return;
@@ -1834,7 +1966,81 @@ export class PixiGraph {
    */
   _restyleElement(ele: PixiGraphElement): void {
     if (this.destroyed) return;
-    this.renderElement(ele);
+    this._pending.set(ele, true);
+    this._schedule();
+  }
+
+  /**
+   * 상태(class/select)만 바뀐 element — 전체 렌더와 같이 microtask 에 모으되, 반영할 때 스타일이 alpha 말고는
+   * 그대로고 alpha 가 0 으로/원래 값으로만 바뀌었으면 Graphics 를 다시 만들지 않고 renderable 만 끄고 켠다
+   * (hidden 모드·하이라이트 dim 이 둘 다 alpha 0 — 수천 개를 한 번에 토글하는 대표 경우).
+   */
+  _restyleState(ele: PixiGraphElement): void {
+    if (this.destroyed) return;
+    if (!this._pending.has(ele)) this._pending.set(ele, false);
+    this._schedule();
+  }
+
+  /**
+   * 쌓인 상태 변경을 지금 반영 — 보통은 microtask 가 알아서 부른다. 같은 틱 안에서 그려진 결과
+   * (Graphics·핸들)가 꼭 필요한 호출부용. 'selectionchange' 도 여기서 발행된다.
+   */
+  flush(): void {
+    this._flushScheduled = false;
+    this._flushRenders();
+    if (this.destroyed) return;
+    if (this._handlesDirty) {
+      this._handlesDirty = false;
+      this._renderHandles();
+    }
+    if (this._selectionDirty) {
+      this._selectionDirty = false;
+      this.eventBus.emit('selectionchange', null);
+    }
+  }
+
+  private _schedule(): void {
+    if (this._flushScheduled || this.destroyed) return;
+    this._flushScheduled = true;
+    queueMicrotask(() => this.flush());
+  }
+
+  /** 쌓인 렌더만 반영(이벤트 발행 없음) — hit-test 처럼 최신 기하가 필요한 질의 앞에서 부른다. */
+  private _flushRenders(): void {
+    if (this.destroyed) { this._pending.clear(); return; }
+    if (!this._pending.size) return;
+    const items = [...this._pending];
+    this._pending.clear();
+    for (const [ele, full] of items) {
+      if (this.elementMap.get(ele.id()) !== ele) continue; // 그새 제거됨
+      if (full) this.renderElement(ele);
+      else this._applyState(ele);
+    }
+  }
+
+  /** alpha 를 뺀 effective style 이 같은지(얕은 비교) — 같으면 alpha 말고는 그릴 모양이 같다. */
+  private _sameStyleExceptAlpha(a: PixiGraphStyleProps, b: PixiGraphStyleProps): boolean {
+    if (a === b) return true;
+    const ra = a as Record<string, unknown>, rb = b as Record<string, unknown>;
+    for (const k in ra) if (k !== 'alpha' && ra[k] !== rb[k]) return false;
+    for (const k in rb) if (k !== 'alpha' && !(k in ra) && rb[k] !== undefined) return false;
+    return true;
+  }
+
+  /** 상태만 바뀐 element 반영 — alpha 0 ↔ 마지막으로 그린 alpha 사이면 표시만 토글, 아니면 전체 렌더. */
+  private _applyState(ele: PixiGraphElement): void {
+    const meta = this._renderMeta.get(ele);
+    if (!meta) { this.renderElement(ele); return; }
+    const defaults = ele.isNode() ? this.nodeDefaults : this.edgeDefaults;
+    const cascade = this.styleEngine.computeStyle(ele, defaults);
+    const hStyle = this.highlightManager.styleFor(ele);
+    const s = hStyle ? { ...cascade, ...hStyle } : cascade;
+    const a = Number(s.alpha ?? defaults.alpha ?? 1);
+    if (!this._sameStyleExceptAlpha(s, meta.style) || (a !== 0 && a !== meta.alpha)) {
+      this.renderElement(ele);
+      return;
+    }
+    ele.view.renderable = a !== 0;
   }
 
   /**
@@ -1888,6 +2094,15 @@ export class PixiGraph {
     const cascade = this.styleEngine.computeStyle(ele, defaults);
     const hStyle = this.highlightManager.styleFor(ele);
     const s = hStyle ? { ...cascade, ...hStyle } : cascade;
+    // 다시 그리는 기록 — 상태 변경 지름길(_applyState)·dash 재렌더 대상·hit 인덱스 무효화.
+    g.renderable = true;
+    this._spatialDirty.add(ele);
+    this._renderMeta.set(ele, { style: s, alpha: Number(s.alpha ?? defaults.alpha ?? 1) });
+    if (ele.isEdge()) {
+      const ld = Number(s.lineDash ?? this.edgeDefaults.lineDash ?? 0);
+      if (ld > 0 || this._edgeSplits?.has(ele.id())) this._dashedEdges.add(ele);
+      else this._dashedEdges.delete(ele);
+    }
 
     if (ele.isNode()) {
       const b = ele.bbox();
@@ -2341,6 +2556,7 @@ export class PixiGraph {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this._pending.clear();
     this.eventBus.destroy();
     this.clear();
     try { this._viewport?.destroy(); } catch { /* noop */ }
