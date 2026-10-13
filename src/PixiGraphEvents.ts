@@ -32,6 +32,8 @@ export type PixiGraphEventType =
   | 'select' | 'unselect'
   /** 선택 집합이 바뀜 — 한 틱의 select/unselect 를 묶어 한 번, target null. */
   | 'selectionchange'
+  /** 하이라이트 그룹 추가/제거·focus color 변경 — 한 틱의 변경을 묶어 한 번, target null. */
+  | 'highlightchange'
   | 'add' | 'remove'
   | 'bbox' | 'rotation' | 'polygon' | 'data';
 

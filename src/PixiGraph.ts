@@ -32,7 +32,7 @@
  * world ↔ local 변환을 담당하므로 graph 내부에선 단위 일관.
  */
 
-import { Container, Graphics, Texture, Matrix, Assets } from 'pixi.js';
+import { Container, Graphics, Texture, Matrix, Assets, Color } from 'pixi.js';
 import {
   DEFAULT_PIXIGRAPH_STYLE,
   type GraphBbox,
@@ -152,6 +152,45 @@ const clipRayToBbox = (center: GraphPoint, bbox: GraphBbox, toward: GraphPoint):
   return { x: center.x + dx * t, y: center.y + dy * t };
 };
 
+/**
+ * element 마지막 렌더 기록 — 상태/스타일만 바뀐 재반영에서 다시 그릴지 판단.
+ *  - geo*: 그릴 때의 기하 입력(참조). bbox/끝점은 바뀌면 새 객체로 교체되므로 참조 비교로 충분.
+ *  - tintable: 단색 element 를 흰색으로 그리고 색은 view.tint 로 입혔는가 — 그렇다면 색만 바뀔 땐 tint 만 바꾼다.
+ */
+interface RenderMeta {
+  style: PixiGraphStyleProps;
+  alpha: number;
+  tintable: boolean;
+  geoA: unknown;
+  geoB: unknown;
+  geoC: unknown;
+  geoD: unknown;
+}
+
+/**
+ * 이미지 노드 texture 참조 수 — URL → 이 texture 를 캐시에 든 graph 수. Assets 캐시는 페이지 전역이라
+ * 같은 URL 을 여러 graph 가 같은 Texture 로 받는다. 마지막 graph 가 놓을 때만 Assets.unload.
+ */
+const imageTextureRefs = new Map<string, number>();
+const retainImageTexture = (url: string): void => {
+  imageTextureRefs.set(url, (imageTextureRefs.get(url) ?? 0) + 1);
+};
+const releaseImageTexture = (url: string): void => {
+  const n = (imageTextureRefs.get(url) ?? 0) - 1;
+  if (n > 0) { imageTextureRefs.set(url, n); return; }
+  imageTextureRefs.delete(url);
+  try { void Assets.unload(url).catch(() => undefined); } catch { /* noop */ }
+};
+
+/** element Graphics render group 묶음 크기 — 작을수록 소수 변경의 재배칭이 싸고, 클수록 draw call 이 적다. */
+const RENDER_CHUNK = 128;
+
+/** tint 로 칠할 수 있는 색인가 — 자체 alpha 가 없는 색(투명도 성분이 있으면 fill alpha 에 곱해지므로 제외). */
+const plainColor = (c: number | string): boolean => {
+  if (typeof c === 'number') return true;
+  try { return Color.shared.setValue(c).alpha === 1; } catch { return false; }
+};
+
 export class PixiGraph {
   /**
    * 외부 pixi scene 에 add 할 root container.
@@ -179,6 +218,8 @@ export class PixiGraph {
   private readonly elementMap = new Map<string, PixiGraphElement>();
   // edge 양방향 pair → 엣지 집합. _parallelEdges 가 elementMap 전체를 순회하면 O(N)·매 add 마다 N²/2 비용 → 인덱스로 O(1) 조회.
   private readonly _edgesByPair = new Map<string, Set<PixiGraphElement>>();
+  /** pair → id 정렬된 평행 엣지 — 매 렌더(dash 애니메이션 포함)마다 정렬하지 않게. pair 의 엣지가 바뀌면 지운다. */
+  private readonly _parallelSorted = new Map<string, PixiGraphElement[]>();
   /** 전역 dash offset — 흐름 시뮬 등 dash 애니메이션용. setDashOffset 으로 갱신 + 점선 엣지 재렌더. */
   private _dashOffsetGlobal = 0;
   /** 엣지별 dash 위상 (id → 경로 누적거리) — 전역 offset 에 가산. setDashPhases 로 교체. */
@@ -223,13 +264,17 @@ export class PixiGraph {
   private _flushScheduled = false;
   private _handlesDirty = false;
   private _selectionDirty = false;
+  private _highlightDirty = false;
   /** 선택된 element — selected() 가 전수 순회하지 않게. */
   private readonly _selectedSet = new Set<PixiGraphElement>();
   /** element 등록 순서 — selected()·hit 후보를 종전(elementMap 순회)과 같은 순서로 돌려주려고. */
   private readonly _seq = new WeakMap<PixiGraphElement, number>();
   private _seqCounter = 0;
-  /** 마지막 전체 렌더의 effective style 과 alpha — 상태 변경이 alpha 만 0 으로/원래로면 재렌더 생략. */
-  private readonly _renderMeta = new WeakMap<PixiGraphElement, { style: PixiGraphStyleProps; alpha: number }>();
+  /**
+   * 마지막 전체 렌더의 effective style·alpha·기하 입력 — 상태/스타일 변경이 alpha 0↔원래 값이거나
+   * (단색 element 의) 색만 바뀐 것이면 다시 그리지 않는다. tintable 이면 흰색으로 그리고 색은 tint 로 입혔다.
+   */
+  private readonly _renderMeta = new WeakMap<PixiGraphElement, RenderMeta>();
   /** dash 또는 분할 렌더 중인 엣지 — dash offset/위상 변경 시 이것만 다시 그린다. */
   private readonly _dashedEdges = new Set<PixiGraphElement>();
   /** hit-test 공간 인덱스 — null 이면 다음 질의 때 통째로 만든다. */
@@ -259,6 +304,8 @@ export class PixiGraph {
   private readonly handlesLayer: Container;
   private readonly handlesGfx: Graphics;
   private _handlesEnabled = false;
+  /** handlesGfx 에 지금 뭔가 그려져 있는가 — 빈 상태에서 빈 상태로의 clear 생략용. */
+  private _handlesDrawn = false;
   private _handleCorners = true;          // 모서리 4개
   private _handleEdges = false;           // 변 가운데 4개
   private _resizeCursor = true;           // hover 시 resize 커서
@@ -321,6 +368,14 @@ export class PixiGraph {
     this.handlesGfx = new Graphics();
     this.handlesGfx.eventMode = 'none';
     this.handlesLayer.addChild(this.handlesGfx);
+    // pixi 포인터 hit-test 제외 — 라이브러리는 feed() + 격자 인덱스로 직접 hit-test 한다.
+    //   이벤트 시스템이 켜진 stage 에서도 수천 개 Graphics 를 훑지 않게 레이어째 가지치기.
+    for (const layer of [this.edgesLayer, this.nodesLayer, this.handlesLayer]) {
+      layer.eventMode = 'none';
+      layer.interactiveChildren = false;
+    }
+    // 핸들은 zoom 마다 다시 그려진다 — 자기 render group 이면 수천 개 element 를 다시 배칭하지 않는다.
+    this.handlesLayer.isRenderGroup = true;
     this._content.addChild(this.edgesLayer);
     this._content.addChild(this.nodesLayer);
     this._content.addChild(this.handlesLayer); // 노드 위
@@ -408,9 +463,11 @@ export class PixiGraph {
 
     // 하이라이트 매니저 — 외부 시스템 (trace / 검색 / ...) 이 그룹 단위 inline style 부여.
     //   auto-dim: highlights 활성 시 그룹에 안 속한 element 들에 자동으로 .dim 클래스 부여.
+    //   그룹 변경은 스타일만 바뀌는 것 — 상태 경로(_restyleState)로 모아 색/alpha 만이면 다시 그리지 않는다.
     this.highlightManager = new HighlightManager({
-      _restyleElement: (ele) => this._restyleElement(ele),
+      _restyleElement: (ele) => this._restyleState(ele),
       elements: () => [...this.elementMap.values()],
+      _onHighlightChange: () => { this._highlightDirty = true; this._schedule(); },
     });
     this.previewManager = new PixiGraphPreview(this);
     this.history = new PixiGraphHistory(this);
@@ -511,7 +568,7 @@ export class PixiGraph {
     if (!Number.isFinite(input.bbox?.w) || !Number.isFinite(input.bbox?.h)) return;
 
     const gfx = new Graphics();
-    this.nodesLayer.addChild(gfx);
+    this._chunkFor(this.nodesLayer).addChild(gfx);
     const ele = new PixiGraphElement({
       id: input.id,
       group: 'node',
@@ -552,7 +609,7 @@ export class PixiGraph {
     };
 
     const gfx = new Graphics();
-    this.edgesLayer.addChild(gfx);
+    this._chunkFor(this.edgesLayer).addChild(gfx);
     const ele = new PixiGraphElement({
       id: input.id,
       group: 'edge',
@@ -570,6 +627,7 @@ export class PixiGraph {
     let set = this._edgesByPair.get(pk);
     if (!set) { set = new Set(); this._edgesByPair.set(pk, set); }
     set.add(ele);
+    this._parallelSorted.delete(pk);
     for (const nid of [input.source, input.target]) {
       let adj = this._edgesByNode.get(nid);
       if (!adj) { adj = new Set(); this._edgesByNode.set(nid, adj); }
@@ -582,6 +640,33 @@ export class PixiGraph {
     // 같은 source/target 쌍의 기존 엣지들 — 곡률 재계산 위해 재렌더.
     this._reRenderParallels(ele);
     this.eventBus.emit('add', ele);
+  }
+
+  /**
+   * element Graphics 를 넣을 묶음 — 레이어 안을 추가 순서대로 RENDER_CHUNK 개씩 나눈 render group.
+   * pixi 는 Graphics 하나를 다시 그려도 그것이 속한 render group 전체를 다시 배칭하므로, 묶음으로 나누면
+   * 드래그·hover·핸들 같은 소수 변경이 묶음 하나만 다시 배칭한다. 항상 마지막 묶음에 붙이므로
+   * 그리는 순서(추가 순서)는 레이어 하나일 때와 같다.
+   */
+  private _chunkFor(layer: Container): Container {
+    const last = layer.children[layer.children.length - 1] as Container | undefined;
+    if (last && last.children.length < RENDER_CHUNK) return last;
+    const chunk = new Container();
+    chunk.isRenderGroup = true;
+    chunk.eventMode = 'none';
+    chunk.interactiveChildren = false;
+    layer.addChild(chunk);
+    return chunk;
+  }
+
+  /** element Graphics 파괴 — 비게 된 묶음은 마지막 묶음이 아니면 같이 정리. */
+  private _destroyView(ele: PixiGraphElement): void {
+    const chunk = ele.view.parent;
+    try { ele.view.destroy(); } catch { /* noop */ }
+    const layer = chunk?.parent;
+    if (chunk && layer && chunk.children.length === 0 && layer.children[layer.children.length - 1] !== chunk) {
+      try { chunk.destroy(); } catch { /* noop */ }
+    }
   }
 
   /** edge pair 인덱스 키 — 양방향 같은 키. */
@@ -605,6 +690,7 @@ export class PixiGraph {
       if (src && tgt) {
         const set = this._edgesByPair.get(this._pairKey(src.id(), tgt.id()));
         if (set) { set.delete(ele); if (set.size === 0) this._edgesByPair.delete(this._pairKey(src.id(), tgt.id())); }
+        this._parallelSorted.delete(this._pairKey(src.id(), tgt.id()));
       }
       const meta = ele.edgeEndpointIds();
       if (meta) {
@@ -615,7 +701,7 @@ export class PixiGraph {
       }
     }
     this.highlightManager._onElementRemoved(ele);
-    try { ele.view.destroy(); } catch { /* noop */ }
+    this._destroyView(ele);
     this.elementMap.delete(id);
     this._selectedSet.delete(ele);
     this._dashedEdges.delete(ele);
@@ -639,8 +725,14 @@ export class PixiGraph {
       this.highlightManager._onElementRemoved(ele);
       try { ele.view.destroy(); } catch { /* noop */ }
     });
+    // 빈 묶음(render group) 정리 — 다음 add 는 새 묶음부터.
+    for (const layer of [this.edgesLayer, this.nodesLayer]) {
+      if (layer.destroyed) continue;
+      layer.removeChildren().forEach((c) => { try { c.destroy(); } catch { /* noop */ } });
+    }
     this.elementMap.clear();
     this._edgesByPair.clear();
+    this._parallelSorted.clear();
     this._edgesByNode.clear();
     this._selectedSet.clear();
     this._dashedEdges.clear();
@@ -1211,9 +1303,11 @@ export class PixiGraph {
   /** 핸들/선택박스 다시 그림 — each(노드별)/union(그룹) 모드의 각 bbox 마다(회전 반영). */
   private _renderHandles(): void {
     const g = this.handlesGfx;
+    const boxes = this._handlesEnabled ? this._handleBoxes() : [];
+    // 그릴 것도 그려 둔 것도 없으면 clear 도 생략 — zoom 마다 불리므로 빈 Graphics 를 갱신하지 않는다.
+    if (!boxes.length && !this._handlesDrawn) return;
     g.clear();
-    if (!this._handlesEnabled) return;
-    const boxes = this._handleBoxes();
+    this._handlesDrawn = boxes.length > 0;
     if (!boxes.length) return;
     const vs = this._viewScale || 1;
     const s = this._handleLocalSize();
@@ -1376,8 +1470,9 @@ export class PixiGraph {
   private _redrawDashedEdges(): void {
     // 쌓인 상태 변경부터 반영 — dash 가 새로 붙거나 떨어진 엣지가 _dashedEdges 에 맞게.
     this._flushRenders();
+    //   dash 위상만 바뀜 — 경로·폭은 그대로라 hit 인덱스는 건드리지 않는다(dashOnly).
     [...this._dashedEdges].forEach((ele) => {
-      if (this.elementMap.get(ele.id()) === ele) this.renderElement(ele);
+      if (this.elementMap.get(ele.id()) === ele) this.renderElement(ele, true);
     });
   }
 
@@ -1762,7 +1857,7 @@ export class PixiGraph {
       const s = ele.sourcePoint();
       const t = ele.targetPoint();
       if (!s || !t) return;
-      const eff = this.styleEngine.computeStyle(ele, this.edgeDefaults);
+      const eff = this.styleEngine.computeStyleCached(ele, this.edgeDefaults);
       const width = Number(eff.width ?? this.edgeDefaults.width ?? 1);
       const threshold = width + this._hitTolerance;
       // 곡선 엣지면 marker 저장된 sample point 들 중 가장 가까운 segment.
@@ -1882,7 +1977,7 @@ export class PixiGraph {
         x1 = cx - r; y1 = cy - r; x2 = cx + r; y2 = cy + r;
       }
     } else {
-      const eff = this.styleEngine.computeStyle(ele, this.edgeDefaults);
+      const eff = this.styleEngine.computeStyleCached(ele, this.edgeDefaults);
       const w = Number(eff.width ?? this.edgeDefaults.width ?? 1);
       if (w > this._maxEdgeWidth) this._maxEdgeWidth = w;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1935,7 +2030,7 @@ export class PixiGraph {
       if (!ele.isEdge() || ele.hasClass('unselected') || ele.hasClass('preview')) return;
       const s = ele.sourcePoint(); const t = ele.targetPoint();
       if (!s || !t) return;
-      const eff = this.styleEngine.computeStyle(ele, this.edgeDefaults);
+      const eff = this.styleEngine.computeStyleCached(ele, this.edgeDefaults);
       const threshold = Number(eff.width ?? this.edgeDefaults.width ?? 1) + this._hitTolerance;
       const d = distancePointSegment(x, y, s.x, s.y, t.x, t.y);
       if (d < threshold && d < bestDist) { bestDist = d; found = ele; }
@@ -1957,7 +2052,9 @@ export class PixiGraph {
   style(rules: PixiGraphStyleRule[]): void {
     this._userStyleRules = rules ?? [];
     this.styleEngine.setRules([...this._systemStyleRules, ...this._userStyleRules]);
-    this.elementMap.forEach((ele) => this.renderElement(ele));
+    // 즉시 그리지 않고 상태 경로로 모은다 — microtask(또는 flush/hit-test 질의)에 element 당 한 번,
+    //   색/alpha 만 바뀐 element 는 다시 그리지 않는다. 같은 틱의 결과가 필요하면 flush().
+    this.elementMap.forEach((ele) => this._restyleState(ele));
   }
 
   /**
@@ -1997,6 +2094,10 @@ export class PixiGraph {
       this._selectionDirty = false;
       this.eventBus.emit('selectionchange', null);
     }
+    if (this._highlightDirty) {
+      this._highlightDirty = false;
+      this.eventBus.emit('highlightchange', null);
+    }
   }
 
   private _schedule(): void {
@@ -2018,29 +2119,72 @@ export class PixiGraph {
     }
   }
 
-  /** alpha 를 뺀 effective style 이 같은지(얕은 비교) — 같으면 alpha 말고는 그릴 모양이 같다. */
-  private _sameStyleExceptAlpha(a: PixiGraphStyleProps, b: PixiGraphStyleProps): boolean {
+  /** alpha·fill·stroke 를 뺀 effective style 이 같은지(얕은 비교) — 같으면 색/alpha 말고는 그릴 모양이 같다. */
+  private _sameStyleExceptPaint(a: PixiGraphStyleProps, b: PixiGraphStyleProps): boolean {
     if (a === b) return true;
     const ra = a as Record<string, unknown>, rb = b as Record<string, unknown>;
-    for (const k in ra) if (k !== 'alpha' && ra[k] !== rb[k]) return false;
-    for (const k in rb) if (k !== 'alpha' && !(k in ra) && rb[k] !== undefined) return false;
+    for (const k in ra) if (k !== 'alpha' && k !== 'fill' && k !== 'stroke' && ra[k] !== rb[k]) return false;
+    for (const k in rb) if (k !== 'alpha' && k !== 'fill' && k !== 'stroke' && !(k in ra) && rb[k] !== undefined) return false;
     return true;
   }
 
-  /** 상태만 바뀐 element 반영 — alpha 0 ↔ 마지막으로 그린 alpha 사이면 표시만 토글, 아니면 전체 렌더. */
+  /** effective style 의 그리기 색 — 노드 fill, 엣지 stroke (renderElement 와 같은 fallback). */
+  private _paintColor(ele: PixiGraphElement, s: PixiGraphStyleProps): number | string {
+    return ele.isNode()
+      ? (s.fill ?? this.nodeDefaults.fill ?? 0x000000)
+      : (s.stroke ?? this.edgeDefaults.stroke ?? 0x000000);
+  }
+
+  /**
+   * effective style = cascade(캐시) + highlight 머지(캐시). 같은 서명끼리 같은 객체 — 읽기 전용.
+   * 머지 결과도 (cascade, highlight) 객체 쌍으로 캐시해 매 렌더 새 객체를 만들지 않는다.
+   */
+  private _effectiveStyle(ele: PixiGraphElement): PixiGraphStyleProps {
+    const defaults = ele.isNode() ? this.nodeDefaults : this.edgeDefaults;
+    const cascade = this.styleEngine.computeStyleCached(ele, defaults);
+    const hStyle = this.highlightManager._styleForCached(ele);
+    if (!hStyle) return cascade;
+    let byH = this._mergedStyles.get(cascade);
+    if (!byH) { byH = new WeakMap(); this._mergedStyles.set(cascade, byH); }
+    let s = byH.get(hStyle);
+    if (!s) { s = { ...cascade, ...hStyle }; byH.set(hStyle, s); }
+    return s;
+  }
+  private readonly _mergedStyles = new WeakMap<PixiGraphStyleProps, WeakMap<PixiGraphStyleProps, PixiGraphStyleProps>>();
+
+  /** 마지막 렌더 이후 기하 입력이 그대로인가 — 직접 렌더를 거치지 않는 setter(shape/polygonPoints/image 등) 대비. */
+  private _sameGeometry(ele: PixiGraphElement, meta: RenderMeta): boolean {
+    if (ele.isNode()) {
+      return meta.geoA === ele.bbox() && meta.geoB === ele.rotation()
+        && meta.geoC === ele.polygonPoints() && meta.geoD === `${ele.shape()}|${ele.image()}`;
+    }
+    return meta.geoA === ele.sourcePoint() && meta.geoB === ele.targetPoint();
+  }
+
+  /**
+   * 상태/스타일만 바뀐 element 반영 — 모양이 같으면:
+   *  - alpha 0 이면 renderable 만 끈다 (hidden·dim — 수천 개를 한 번에 토글하는 대표 경우).
+   *  - alpha 가 마지막으로 그린 값이고 색이 같으면 renderable 만 켠다.
+   *  - alpha 가 같고 색만 바뀌었으면 tintable element 는 tint 만 바꾼다(다시 그리지 않음).
+   * 그 밖에는 전체 렌더. view.alpha 는 건드리지 않는다(소비자가 애니메이션에 쓴다).
+   */
   private _applyState(ele: PixiGraphElement): void {
     const meta = this._renderMeta.get(ele);
-    if (!meta) { this.renderElement(ele); return; }
+    if (!meta || !this._sameGeometry(ele, meta)) { this.renderElement(ele); return; }
     const defaults = ele.isNode() ? this.nodeDefaults : this.edgeDefaults;
-    const cascade = this.styleEngine.computeStyle(ele, defaults);
-    const hStyle = this.highlightManager.styleFor(ele);
-    const s = hStyle ? { ...cascade, ...hStyle } : cascade;
+    const s = this._effectiveStyle(ele);
+    if (!this._sameStyleExceptPaint(s, meta.style)) { this.renderElement(ele); return; }
     const a = Number(s.alpha ?? defaults.alpha ?? 1);
-    if (!this._sameStyleExceptAlpha(s, meta.style) || (a !== 0 && a !== meta.alpha)) {
-      this.renderElement(ele);
-      return;
+    if (a === 0) { ele.view.renderable = false; return; }
+    if (a !== meta.alpha) { this.renderElement(ele); return; }
+    if (s.fill !== meta.style.fill || s.stroke !== meta.style.stroke) {
+      const c = this._paintColor(ele, s);
+      if (!meta.tintable || !plainColor(c)) { this.renderElement(ele); return; }
+      // 색만 바뀜 — 그린 모양(흰색)은 그대로 두고 tint 만. 같은 렌더 경로의 결과와 픽셀 동일.
+      ele.view.tint = c;
+      meta.style = s;
     }
-    ele.view.renderable = a !== 0;
+    ele.view.renderable = true;
   }
 
   /**
@@ -2057,7 +2201,8 @@ export class PixiGraph {
     if (cached) return null; // 로딩 중 — 완료 후 자동 재렌더 예약됨.
     // cache miss → load 시작.
     const p = Assets.load<Texture>(url).then((tex) => {
-      if (this.destroyed) return null;
+      retainImageTexture(url);
+      if (this.destroyed) { releaseImageTexture(url); return null; }
       this._imageTextureCache.set(url, tex);
       // 같은 URL 을 쓰는 모든 노드 재렌더.
       this.elementMap.forEach((el) => {
@@ -2087,17 +2232,27 @@ export class PixiGraph {
    *  - 엣지: moveTo/lineTo + stroke({stroke, width, alpha})
    *  - fill/stroke 가 미정이면 group defaults 의 값 사용 (안전 fallback).
    */
-  private renderElement(ele: PixiGraphElement): void {
+  private renderElement(ele: PixiGraphElement, dashOnly = false): void {
     const g = ele.view;
     g.clear();
     const defaults = ele.isNode() ? this.nodeDefaults : this.edgeDefaults;
-    const cascade = this.styleEngine.computeStyle(ele, defaults);
-    const hStyle = this.highlightManager.styleFor(ele);
-    const s = hStyle ? { ...cascade, ...hStyle } : cascade;
+    const s = this._effectiveStyle(ele);
+    // 단색 element(분할·이미지 아님)는 흰색으로 그리고 색은 tint — 이후 색만 바뀌면 tint 만 바꾼다.
+    //   pixi 는 정점색 = 그린 색 × tint 라 흰색×C 와 C×흰색이 같은 값(픽셀 동일).
+    const paint = this._paintColor(ele, s);
+    const tintable = plainColor(paint) && (ele.isNode()
+      ? !ele.image() && !this._nodeSplits?.has(ele.id())
+      : !this._edgeSplits?.has(ele.id()));
+    g.tint = tintable ? paint : 0xffffff;
     // 다시 그리는 기록 — 상태 변경 지름길(_applyState)·dash 재렌더 대상·hit 인덱스 무효화.
+    //   dashOnly(dash 위상만 바뀜)는 경로·폭이 그대로라 hit 인덱스를 건드리지 않는다.
     g.renderable = true;
-    this._spatialDirty.add(ele);
-    this._renderMeta.set(ele, { style: s, alpha: Number(s.alpha ?? defaults.alpha ?? 1) });
+    if (!dashOnly) this._spatialDirty.add(ele);
+    this._renderMeta.set(ele, ele.isNode()
+      ? { style: s, alpha: Number(s.alpha ?? defaults.alpha ?? 1), tintable,
+        geoA: ele.bbox(), geoB: ele.rotation(), geoC: ele.polygonPoints(), geoD: `${ele.shape()}|${ele.image()}` }
+      : { style: s, alpha: Number(s.alpha ?? defaults.alpha ?? 1), tintable,
+        geoA: ele.sourcePoint(), geoB: ele.targetPoint(), geoC: null, geoD: null });
     if (ele.isEdge()) {
       const ld = Number(s.lineDash ?? this.edgeDefaults.lineDash ?? 0);
       if (ld > 0 || this._edgeSplits?.has(ele.id())) this._dashedEdges.add(ele);
@@ -2155,7 +2310,7 @@ export class PixiGraph {
         });
       } else {
         g.fill({
-          color: s.fill ?? this.nodeDefaults.fill ?? 0x000000,
+          color: tintable ? 0xffffff : paint,
           alpha: s.alpha ?? this.nodeDefaults.alpha ?? 1,
         });
       }
@@ -2164,7 +2319,8 @@ export class PixiGraph {
     // edge
     let sp = ele.sourcePoint(); let tp = ele.targetPoint();
     if (!sp || !tp) return;
-    const color = s.stroke ?? this.edgeDefaults.stroke ?? 0x000000;
+    // 선·화살표·캡 모두 이 한 색 — tintable 이면 흰색(색은 tint).
+    const color = tintable ? 0xffffff : paint;
     const rawWidth = Number(s.width ?? this.edgeDefaults.width ?? 1);
     const alpha = s.alpha ?? this.edgeDefaults.alpha ?? 1;
     const arrowShape = (s.arrowShape ?? this.edgeDefaults.arrowShape ?? 'none') as ('triangle' | 'none');
@@ -2333,9 +2489,16 @@ export class PixiGraph {
   private _parallelEdges(ele: PixiGraphElement): PixiGraphElement[] {
     const src = ele.source(); const tgt = ele.target();
     if (!src || !tgt) return [ele];
-    const set = this._edgesByPair.get(this._pairKey(src.id(), tgt.id()));
+    const pk = this._pairKey(src.id(), tgt.id());
+    const set = this._edgesByPair.get(pk);
     if (!set || set.size === 0) return [ele];
-    return [...set].sort((a, b) => a.id().localeCompare(b.id()));
+    // 정렬 결과 캐시(읽기 전용) — pair 의 엣지 추가/제거 때 지운다.
+    let sorted = this._parallelSorted.get(pk);
+    if (!sorted) {
+      sorted = [...set].sort((a, b) => a.id().localeCompare(b.id()));
+      this._parallelSorted.set(pk, sorted);
+    }
+    return sorted;
   }
 
   // ──────────────────────────────────────────────────────────
@@ -2562,11 +2725,12 @@ export class PixiGraph {
     try { this._viewport?.destroy(); } catch { /* noop */ }
     try { this.edgesLayer.destroy({ children: true }); } catch { /* noop */ }
     try { this.nodesLayer.destroy({ children: true }); } catch { /* noop */ }
-    // image texture 캐시 정리 — Texture 만 destroy (Promise 는 자체 catch 로 noop).
-    this._imageTextureCache.forEach((v) => {
-      if (v instanceof Texture) {
-        try { v.destroy(true); } catch { /* noop */ }
-      }
+    // image texture 캐시 정리 — Assets.load 로 받은 것이므로 Assets.unload 로 해제(캐시에서도 빠져
+    //   같은 URL 을 다시 load 할 수 있다). destroy 로 직접 부수면 Assets 캐시에 파괴된 texture 가 남는다.
+    //   로딩 중(Promise)인 것은 완료 콜백이 destroyed 를 보고 버린다.
+    //   Assets 캐시는 페이지 전역이라 같은 URL 을 쓰는 다른 graph(분할 패인 등)가 있으면 남겨 둔다(참조 수).
+    this._imageTextureCache.forEach((v, url) => {
+      if (v instanceof Texture) releaseImageTexture(url);
     });
     this._imageTextureCache.clear();
     const outer = this.view;

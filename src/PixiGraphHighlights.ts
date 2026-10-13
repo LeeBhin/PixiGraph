@@ -45,6 +45,8 @@ export interface HighlightManagerGraphHandle {
   _restyleElement(ele: PixiGraphElement): void;
   /** 모든 element 반환 — auto-dim 갱신에 사용. */
   elements(): PixiGraphElement[];
+  /** 그룹/focus 변경 통지 — graph 가 'highlightchange' 를 microtask 에 한 번 발행. */
+  _onHighlightChange?(): void;
 }
 
 interface ResolvedHighlight {
@@ -71,6 +73,9 @@ export class HighlightManager {
    */
   private _focusColor: number | null = null;
 
+  /** styleFor 캐시 — 소속 그룹 id 서명 → 머지 결과. 그룹이 추가/제거되면 비운다(그룹 style 은 add 때 복사돼 불변). */
+  private readonly _styleCache = new Map<string, PixiGraphStyleProps>();
+
   constructor(graph: HighlightManagerGraphHandle) { this.graph = graph; }
 
   /**
@@ -89,6 +94,8 @@ export class HighlightManager {
       noDim: !!input.noDim,
     };
     this.highlights.set(input.id, resolved);
+    this._styleCache.clear();
+    this.graph._onHighlightChange?.();
     resolved.elements.forEach((ele) => {
       (ele as HighlightableElement)._highlightGroupIds.add(input.id);
       this.graph._restyleElement(ele);
@@ -101,6 +108,8 @@ export class HighlightManager {
     const h = this.highlights.get(id);
     if (!h) return;
     this.highlights.delete(id);
+    this._styleCache.clear();
+    this.graph._onHighlightChange?.();
     h.elements.forEach((ele) => {
       (ele as HighlightableElement)._highlightGroupIds.delete(id);
       this.graph._restyleElement(ele);
@@ -143,6 +152,7 @@ export class HighlightManager {
     const next = colorToInt(color);
     if (this._focusColor === next) return;
     this._focusColor = next;
+    this.graph._onHighlightChange?.();
     this._updateDim();
   }
 
@@ -210,14 +220,27 @@ export class HighlightManager {
    * 등록 순서로 cascade — 후순위 그룹 prop 이 동일 prop 을 이김 (CSS-like).
    */
   styleFor(ele: PixiGraphElement): PixiGraphStyleProps | null {
+    const m = this._styleForCached(ele);
+    return m ? { ...m } : null;
+  }
+
+  /**
+   * styleFor 의 캐시판 — 같은 그룹 집합에 속한 element 끼리 같은 객체. 읽기 전용(수정 금지).
+   * 머지 결과는 그룹 집합(등록 순서 cascade)에만 달렸으므로 정렬한 id 들을 키로 쓴다.
+   */
+  _styleForCached(ele: PixiGraphElement): PixiGraphStyleProps | null {
     const groupIds = (ele as HighlightableElement)._highlightGroupIds;
     if (groupIds.size === 0) return null;
+    const key = groupIds.size === 1 ? (groupIds.values().next().value as string) : [...groupIds].sort().join('\u0001');
+    const hit = this._styleCache.get(key);
+    if (hit) return hit;
     let merged: PixiGraphStyleProps | null = null;
     this.highlights.forEach((h) => {
       if (!groupIds.has(h.id)) return;
       if (!merged) merged = {};
       Object.assign(merged, h.style);
     });
+    if (merged) this._styleCache.set(key, merged);
     return merged;
   }
 

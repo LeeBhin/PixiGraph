@@ -96,6 +96,10 @@ export class PixiGraphViewport {
     this._graph = graph;
     this.view = new Container();
     this._world = new Container();
+    // render group — pan/zoom 이 world 변환 하나(GPU uniform)로 끝난다. 아니면 변환이 바뀔 때마다
+    //   하위 수천 개 Graphics 의 world 변환·정점을 CPU 에서 다시 계산한다.
+    //   (자식 render group 의 갱신 목록은 부모 renderGroup.renderGroupChildren 로 따라가면 보인다.)
+    this._world.isRenderGroup = true;
     this.view.addChild(this._world);
     this._world.addChild(graphView);
     this._cfg = {

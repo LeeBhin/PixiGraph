@@ -116,6 +116,13 @@ export const matchesSelector = (ele: PixiGraphElement, sel: ParsedSelector): boo
  */
 export class StyleEngine {
   private rules: ParsedStyleRule[] = [];
+  /** 규칙에 등장하는 #id — 그 id 의 element 만 캐시 키에 id 를 넣는다. */
+  private ruleIds = new Set<string>();
+  /**
+   * effective style 캐시 — defaults 객체별, 매칭을 결정하는 서명(group·selected·id·classes) 별.
+   * 매칭은 이 네 가지로만 정해지므로 같은 서명이면 결과가 같다. setRules 때 통째로 비운다.
+   */
+  private cache = new WeakMap<PixiGraphStyleProps, Map<string, PixiGraphStyleProps>>();
 
   /** 전체 규칙 교체 (cytoscape `cy.style()` 동작 — replace, not merge). */
   setRules(rules: PixiGraphStyleRule[]): void {
@@ -124,20 +131,39 @@ export class StyleEngine {
       style: r.style,
       declOrder: i,
     }));
+    this.ruleIds = new Set(this.rules.map((r) => r.parsed.id).filter((id): id is string => !!id));
+    this.cache = new WeakMap();
   }
 
   /**
    * element 에 매칭되는 모든 규칙을 specificity 오름차순 + 선언순서 오름차순으로 정렬해
-   * defaults 위에 cascade.
+   * defaults 위에 cascade. 반환값은 호출자 소유(복사본).
    */
   computeStyle(ele: PixiGraphElement, defaults: PixiGraphStyleProps): PixiGraphStyleProps {
+    return { ...this.computeStyleCached(ele, defaults) };
+  }
+
+  /**
+   * computeStyle 의 캐시판 — 같은 서명의 element 끼리 같은 객체를 돌려준다. 읽기 전용(수정 금지).
+   * 규칙 객체를 setRules 뒤에 바깥에서 고치면 반영되지 않는다(다시 setRules 할 것).
+   */
+  computeStyleCached(ele: PixiGraphElement, defaults: PixiGraphStyleProps): PixiGraphStyleProps {
+    let byKey = this.cache.get(defaults);
+    if (!byKey) { byKey = new Map(); this.cache.set(defaults, byKey); }
+    const id = ele.id();
+    const cls = ele.classes();
+    if (cls.length > 1) cls.sort();
+    const key = `${ele.group()}\u0001${ele.selected() ? 1 : 0}\u0001${this.ruleIds.has(id) ? id : ''}\u0001${cls.join('\u0001')}`;
+    let out = byKey.get(key);
+    if (out) return out;
     const matched = this.rules.filter((r) => matchesSelector(ele, r.parsed));
     matched.sort((a, b) =>
       (a.parsed.specificity - b.parsed.specificity)
       || (a.declOrder - b.declOrder),
     );
-    const out: PixiGraphStyleProps = { ...defaults };
+    out = { ...defaults };
     for (const r of matched) Object.assign(out, r.style);
+    byKey.set(key, out);
     return out;
   }
 }
