@@ -32,7 +32,8 @@
  * world ↔ local 변환을 담당하므로 graph 내부에선 단위 일관.
  */
 
-import { Container, Graphics, Texture, Matrix, Assets, Color } from 'pixi.js';
+import { Container, Graphics, Texture, Matrix, Assets, Color, type UniformGroup } from 'pixi.js';
+import { DashBatch, createDashUniforms, type DashBody } from './PixiGraphDash';
 import {
   DEFAULT_PIXIGRAPH_STYLE,
   type GraphBbox,
@@ -277,6 +278,19 @@ export class PixiGraph {
   private readonly _renderMeta = new WeakMap<PixiGraphElement, RenderMeta>();
   /** dash 또는 분할 렌더 중인 엣지 — dash offset/위상 변경 시 이것만 다시 그린다. */
   private readonly _dashedEdges = new Set<PixiGraphElement>();
+  /**
+   * GPU dash — 점선 몸통을 묶음별 셰이더 메시로 그린다(offset 변경 = uniform 하나). config.gpuDash=false 이거나
+   * WebGL2 가 아닌 렌더러를 만나면 false — 예전처럼 매번 Graphics 로 끊어 그린다.
+   */
+  private _gpuDash: boolean;
+  /** 모든 묶음 메시가 함께 보는 uniform(uOffset). */
+  private readonly _dashUniforms: UniformGroup = createDashUniforms();
+  /** 묶음(chunk) → 점선 몸통 메시. */
+  private readonly _dashBatches = new Map<Container, DashBatch>();
+  /** 메시로 그리는 엣지 → 그 묶음·주기·전역 offset 사용 여부. */
+  private _dashBodyOf = new WeakMap<PixiGraphElement, { batch: DashBatch; period: number; global: boolean }>();
+  /** 전역 offset 을 쓰는 몸통의 주기별 개수 — uOffset 을 주기로 접어 float32 정밀도를 지킨다. */
+  private readonly _dashPeriods = new Map<number, number>();
   /** hit-test 공간 인덱스 — null 이면 다음 질의 때 통째로 만든다. */
   private _spatial: SpatialGrid | null = null;
   /** 인덱스 이후 기하가 바뀐 element — 다음 질의 때 이것만 다시 넣는다. */
@@ -361,6 +375,7 @@ export class PixiGraph {
   private _userStyleRules: PixiGraphStyleRule[] = [];
 
   constructor(config: PixiGraphConfig = {}) {
+    this._gpuDash = config.gpuDash !== false;
     this._content = new Container();
     this.edgesLayer = new Container();
     this.nodesLayer = new Container();
@@ -609,7 +624,10 @@ export class PixiGraph {
     };
 
     const gfx = new Graphics();
-    this._chunkFor(this.edgesLayer).addChild(gfx);
+    // 점선 메시가 있는 묶음이면 그 아래(메시는 묶음 맨 위).
+    const chunk = this._chunkFor(this.edgesLayer);
+    if (this._dashBatches.has(chunk)) chunk.addChildAt(gfx, chunk.children.length - 1);
+    else chunk.addChild(gfx);
     const ele = new PixiGraphElement({
       id: input.id,
       group: 'edge',
@@ -650,7 +668,8 @@ export class PixiGraph {
    */
   private _chunkFor(layer: Container): Container {
     const last = layer.children[layer.children.length - 1] as Container | undefined;
-    if (last && last.children.length < RENDER_CHUNK) return last;
+    // 점선 메시(있으면 맨 뒤 자식)는 세지 않는다.
+    if (last && last.children.length - (this._dashBatches.has(last) ? 1 : 0) < RENDER_CHUNK) return last;
     const chunk = new Container();
     chunk.isRenderGroup = true;
     chunk.eventMode = 'none';
@@ -662,9 +681,12 @@ export class PixiGraph {
   /** element Graphics 파괴 — 비게 된 묶음은 마지막 묶음이 아니면 같이 정리. */
   private _destroyView(ele: PixiGraphElement): void {
     const chunk = ele.view.parent;
+    this._clearDashBody(ele);
     try { ele.view.destroy(); } catch { /* noop */ }
     const layer = chunk?.parent;
-    if (chunk && layer && chunk.children.length === 0 && layer.children[layer.children.length - 1] !== chunk) {
+    const batch = chunk ? this._dashBatches.get(chunk) : undefined;
+    if (chunk && layer && chunk.children.length === (batch ? 1 : 0) && layer.children[layer.children.length - 1] !== chunk) {
+      if (batch) { batch.destroy(); this._dashBatches.delete(chunk); }
       try { chunk.destroy(); } catch { /* noop */ }
     }
   }
@@ -725,6 +747,11 @@ export class PixiGraph {
       this.highlightManager._onElementRemoved(ele);
       try { ele.view.destroy(); } catch { /* noop */ }
     });
+    // 점선 메시 — 묶음보다 먼저(묶음 destroy 는 자식을 부수지 않는다).
+    this._dashBatches.forEach((b) => b.destroy());
+    this._dashBatches.clear();
+    this._dashBodyOf = new WeakMap();
+    this._dashPeriods.clear();
     // 빈 묶음(render group) 정리 — 다음 add 는 새 묶음부터.
     for (const layer of [this.edgesLayer, this.nodesLayer]) {
       if (layer.destroyed) continue;
@@ -1404,11 +1431,90 @@ export class PixiGraph {
     this._renderHandles();
   }
 
-  /** 전역 dash offset — 흐름 시뮬 등 dash 애니메이션. dash 가 있는 엣지만 재렌더 → 비싸지 않음. */
+  /**
+   * 전역 dash offset — 흐름 시뮬 등 dash 애니메이션. GPU dash(WebGL2) 면 uniform 하나만 바꾸고 다시 그리지 않는다
+   * (hit 인덱스도 그대로). 묶음 메시를 렌더 그룹 장부에 '바뀜' 으로 남기므로 장부를 보고 그리는 소비자도 다음 프레임을 그린다.
+   * 분할 엣지·GPU dash 불가 렌더러만 예전처럼 Graphics 로 다시 그린다.
+   */
   setDashOffset(offset: number): void {
     if (this._dashOffsetGlobal === offset) return;
     this._dashOffsetGlobal = offset;
-    this._redrawDashedEdges();
+    // 메시 몸통 — uniform 하나. 메시마다 렌더 그룹 장부에 표시만 해 둔다(장부를 보고 그리는 소비자용).
+    this._syncDashUniform();
+    this._dashBatches.forEach((b) => { if (b.globalCount) b.touch(); });
+    // Graphics 경로(분할 엣지·GPU dash 불가)만 예전처럼 다시 그린다.
+    this._flushRenders();
+    const cpu: PixiGraphElement[] = [];
+    this._dashedEdges.forEach((ele) => { if (!this._dashBodyOf.has(ele)) cpu.push(ele); });
+    cpu.forEach((ele) => { if (this.elementMap.get(ele.id()) === ele) this.renderElement(ele, true); });
+  }
+
+  /** uOffset = 전역 offset 을 몸통 주기(여럿이면 정수 주기의 최소공배수)로 접은 값 — 패턴은 같고 float32 오차만 준다. */
+  private _syncDashUniform(): void {
+    let off = this._dashOffsetGlobal;
+    let m = 0;
+    for (const p of this._dashPeriods.keys()) {
+      if (m === 0) m = p;
+      else if (m !== p) {
+        if (!Number.isInteger(m) || !Number.isInteger(p)) { m = 0; break; }
+        let a = m, b = p;
+        while (b) [a, b] = [b, a % b];
+        m = (m / a) * p;
+        if (m > 1e6) { m = 0; break; }
+      }
+    }
+    if (m > 0) off = ((off % m) + m) % m;
+    this._dashUniforms.uniforms.uOffset = off;
+    this._dashUniforms.update();
+  }
+
+  /** 점선 몸통을 ele.view 가 든 묶음의 메시에 등록(교체). */
+  private _setDashBody(ele: PixiGraphElement, chunk: Container, body: DashBody): void {
+    let batch = this._dashBatches.get(chunk);
+    if (!batch) {
+      batch = new DashBatch(chunk, this._dashUniforms, () => this._dashUnsupported());
+      this._dashBatches.set(chunk, batch);
+    }
+    this._clearDashBody(ele);
+    batch.set(ele, body);
+    const period = body.dash + body.gap;
+    this._dashBodyOf.set(ele, { batch, period, global: body.useGlobal });
+    if (body.useGlobal) {
+      const had = this._dashPeriods.has(period);
+      this._dashPeriods.set(period, (this._dashPeriods.get(period) ?? 0) + 1);
+      if (!had) this._syncDashUniform();
+    }
+  }
+
+  /** 점선 몸통 해제(없으면 무시). */
+  private _clearDashBody(ele: PixiGraphElement): void {
+    const b = this._dashBodyOf.get(ele);
+    if (!b) return;
+    this._dashBodyOf.delete(ele);
+    b.batch.delete(ele);
+    if (b.global) {
+      const n = (this._dashPeriods.get(b.period) ?? 1) - 1;
+      if (n > 0) this._dashPeriods.set(b.period, n);
+      else this._dashPeriods.delete(b.period);
+    }
+  }
+
+  /**
+   * 렌더러가 GPU dash 를 못 그린다(WebGL2 아님) — 메시 경로를 끄고 점선 엣지를 Graphics 로 다시 그린다.
+   * 렌더 도중(onRender)에 불리므로 메시는 숨기기만 하고 파괴는 microtask 로 미룬다.
+   */
+  private _dashUnsupported(): void {
+    if (!this._gpuDash) return;
+    this._gpuDash = false;
+    const batches = [...this._dashBatches.values()];
+    this._dashBatches.clear();
+    this._dashBodyOf = new WeakMap();
+    this._dashPeriods.clear();
+    batches.forEach((b) => { b.mesh.visible = false; });
+    queueMicrotask(() => batches.forEach((b) => b.destroy()));
+    [...this._dashedEdges].forEach((ele) => {
+      if (this.elementMap.get(ele.id()) === ele) this.renderElement(ele, true);
+    });
   }
 
   /**
@@ -1466,7 +1572,7 @@ export class PixiGraph {
     return adj ? [...adj] : [];
   }
 
-  /** dash 스타일 엣지 일괄 재렌더 (전역 offset/위상 변경 시). */
+  /** dash 스타일 엣지 일괄 재렌더 (위상 변경 시 — GPU dash 몸통도 위상이 정점에 있어 다시 만든다). */
   private _redrawDashedEdges(): void {
     // 쌓인 상태 변경부터 반영 — dash 가 새로 붙거나 떨어진 엣지가 _dashedEdges 에 맞게.
     this._flushRenders();
@@ -2317,6 +2423,7 @@ export class PixiGraph {
       return;
     }
     // edge
+    this._clearDashBody(ele);
     let sp = ele.sourcePoint(); let tp = ele.targetPoint();
     if (!sp || !tp) return;
     // 선·화살표·캡 모두 이 한 색 — tintable 이면 흰색(색은 tint).
@@ -2425,6 +2532,7 @@ export class PixiGraph {
       pts.push({ x: endX, y: endY });
       this._drawSplitEdge(g, pts, edgeSplit, { stroke: color, width, alpha, lineDash, lineGap, dashOffset: lineDashOffset });
     } else if (drawLine) {
+      let meshBody = false;
       if (lineDash > 0) {
         // dashed — 곡선은 24 sample 로 sampling 후 polyline dash.
         const pts: GraphPoint[] = [{ x: startX, y: startY }];
@@ -2436,13 +2544,24 @@ export class PixiGraph {
           }
         }
         pts.push({ x: endX, y: endY });
-        this._dashPolyline(g, pts, lineDash, lineGap, lineDashOffset);
+        if (this._gpuDash && g.parent) {
+          // GPU dash — 몸통은 묶음 메시(offset 은 uniform). 위상 = style offset(있으면 전역 대신) + 엣지별 위상.
+          const flat: number[] = [];
+          pts.forEach((p) => { flat.push(p.x, p.y); });
+          const useGlobal = s.lineDashOffset == null;
+          this._setDashBody(ele, g.parent, {
+            pts: flat, halfW, dash: lineDash, gap: lineGap,
+            phase: (useGlobal ? 0 : Number(s.lineDashOffset)) + (this._dashPhases ? (this._dashPhases.get(ele.id()) ?? 0) : 0),
+            useGlobal, round: startRound && endRound, color, alpha: Number(alpha), view: g, order: this._seq.get(ele) ?? 0,
+          });
+          meshBody = true;
+        } else this._dashPolyline(g, pts, lineDash, lineGap, lineDashOffset);
       } else if (isCurve) g.moveTo(startX, startY).quadraticCurveTo(cpX, cpY, endX, endY);
       else g.moveTo(startX, startY).lineTo(endX, endY);
       // PIXI stroke 의 cap 은 양 끝 공통 — start/end 가 다르면 butt 로 긋고 round 인 끝에 캡을 따로 그린다.
       //   전체 원을 박으면 라인과 겹쳐(alpha 중첩) 진해지므로, 라인 바깥쪽 "반원" 만 그린다.
       const symmetricCap = startRound === endRound;
-      g.stroke({ color, width, alpha, cap: symmetricCap && startRound ? 'round' : 'butt' });
+      if (!meshBody) g.stroke({ color, width, alpha, cap: symmetricCap && startRound ? 'round' : 'butt' });
       if (!symmetricCap) {
         if (startRound) {
           // 시작: 라인 진행(sux) 반대쪽(뒤)으로 부푸는 반원.

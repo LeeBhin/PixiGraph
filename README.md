@@ -482,7 +482,9 @@ graph.on('mouseover', 'node', ({ target }) => {
 
 ## Dashed Flow Animation
 
-Give edges a dash, then animate the global dash offset for a directional "flow" effect. Only dashed edges re-render, so it's cheap.
+Give edges a dash, then animate the global dash offset for a directional "flow" effect.
+
+On WebGL2 the dashed edge bodies are drawn by a shader mesh (one per 128-edge render group), so `setDashOffset` only updates a uniform — no re-tessellation, no hit-index churn. It also marks those meshes as updated in Pixi's render-group bookkeeping, so render-on-demand loops that watch it keep animating. Split edges (`setEdgeSplits`), non-WebGL2 renderers and `gpuDash: false` use the Graphics path (re-drawn per offset change). Within a render group the dashed bodies draw above that group's solid edges.
 
 ```ts
 graph.style([
@@ -525,6 +527,7 @@ new PixiGraph({
   tooltip?:          boolean | PixiGraphTooltipOptions,    // hover tooltip entries
   viewport?:         boolean | PixiGraphViewportConfig,    // pan/zoom camera
   picking?:          PixiGraphPickingOptions,              // overlap picking: { cycle, cycleModifier }
+  gpuDash?:          boolean,                              // shader-drawn dashed edges (default true, WebGL2 only)
 });
 ```
 

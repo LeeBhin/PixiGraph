@@ -269,4 +269,9 @@ export interface PixiGraphConfig {
    * 자동으로 setViewScale / setHitTolerance 동기화.
    */
   viewport?: boolean | import('./PixiGraphViewport').PixiGraphViewportConfig;
+  /**
+   * 점선 엣지 몸통을 GPU 셰이더로 그린다(기본 true) — setDashOffset 이 uniform 하나만 바꾼다.
+   * WebGL2 가 아니면 자동으로 Graphics 경로. false 면 항상 Graphics(0.6.0 동작).
+   */
+  gpuDash?: boolean;
 }
