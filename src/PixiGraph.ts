@@ -287,8 +287,9 @@ export class PixiGraph {
   private readonly _dashUniforms: UniformGroup = createDashUniforms();
   /** 묶음(chunk) → 점선 몸통 메시. */
   private readonly _dashBatches = new Map<Container, DashBatch>();
-  /** 메시로 그리는 엣지 → 그 묶음·주기·전역 offset 사용 여부. */
-  private _dashBodyOf = new WeakMap<PixiGraphElement, { batch: DashBatch; period: number; global: boolean }>();
+  /** 메시로 그리는 엣지 → 그 묶음·전역 offset 을 쓰는 몸통들의 주기. 분할 엣지는 점선 구간이 없어도(batch null)
+   *  올린다 — offset 이 바뀌어도 다시 그릴 게 없다는 표시. */
+  private _dashBodyOf = new WeakMap<PixiGraphElement, { batch: DashBatch | null; periods: number[] }>();
   /** 전역 offset 을 쓰는 몸통의 주기별 개수 — uOffset 을 주기로 접어 float32 정밀도를 지킨다. */
   private readonly _dashPeriods = new Map<number, number>();
   /** hit-test 공간 인덱스 — null 이면 다음 질의 때 통째로 만든다. */
@@ -1115,12 +1116,14 @@ export class PixiGraph {
    * 엣지 분할 렌더 본체 — 폴리라인을 경로거리 split.at 에서 둘로 잘라 각 구간을
    * 자기 스타일로 스트로크한다. 구간 스타일 null = 미표시(빈 배관), 미지정 필드 = base 상속.
    * dash 구간의 패턴 위상은 전체 경로 기준으로 이어지도록 구간 시작거리를 offset 에 가산.
+   * gpu 가 오면 점선 구간은 Graphics 대신 몸통으로 모은다(위상 = gpu.phase + 구간 시작거리) — 실선 구간만 g 에 남는다.
    */
   private _drawSplitEdge(
     g: Graphics,
     pts: GraphPoint[],
     split: PixiGraphEdgeSplit,
     base: { stroke: string | number; width: number; alpha: number; lineDash: number; lineGap: number; dashOffset: number },
+    gpu?: { phase: number; useGlobal: boolean; order: number; out: DashBody[] },
   ): void {
     if (pts.length < 2) return;
     let total = 0;
@@ -1135,6 +1138,16 @@ export class PixiGraph {
       const st = ov || {};
       const dashR = Number(st.lineDash ?? base.lineDash);
       const gapR = Number(st.lineGap ?? (st.lineDash != null ? st.lineDash : base.lineGap));
+      if (dashR > 0 && gpu) {
+        const flat: number[] = [];
+        regionPts.forEach((p) => { flat.push(p.x, p.y); });
+        gpu.out.push({
+          pts: flat, halfW: Number(st.width ?? base.width) / 2, dash: dashR, gap: gapR,
+          phase: gpu.phase + startDist, useGlobal: gpu.useGlobal, round: false,
+          color: st.stroke ?? base.stroke, alpha: Number(st.alpha ?? base.alpha), view: g, order: gpu.order,
+        });
+        return;
+      }
       if (dashR > 0) {
         this._dashPolyline(g, regionPts, dashR, gapR, base.dashOffset + startDist);
       } else {
@@ -1434,7 +1447,7 @@ export class PixiGraph {
   /**
    * 전역 dash offset — 흐름 시뮬 등 dash 애니메이션. GPU dash(WebGL2) 면 uniform 하나만 바꾸고 다시 그리지 않는다
    * (hit 인덱스도 그대로). 묶음 메시를 렌더 그룹 장부에 '바뀜' 으로 남기므로 장부를 보고 그리는 소비자도 다음 프레임을 그린다.
-   * 분할 엣지·GPU dash 불가 렌더러만 예전처럼 Graphics 로 다시 그린다.
+   * GPU dash 불가 렌더러(또는 gpuDash:false)만 예전처럼 Graphics 로 다시 그린다 — 분할 엣지도 점선 구간은 메시다.
    */
   setDashOffset(offset: number): void {
     if (this._dashOffsetGlobal === offset) return;
@@ -1442,7 +1455,7 @@ export class PixiGraph {
     // 메시 몸통 — uniform 하나. 메시마다 렌더 그룹 장부에 표시만 해 둔다(장부를 보고 그리는 소비자용).
     this._syncDashUniform();
     this._dashBatches.forEach((b) => { if (b.globalCount) b.touch(); });
-    // Graphics 경로(분할 엣지·GPU dash 불가)만 예전처럼 다시 그린다.
+    // Graphics 경로(GPU dash 불가)만 예전처럼 다시 그린다.
     this._flushRenders();
     const cpu: PixiGraphElement[] = [];
     this._dashedEdges.forEach((ele) => { if (!this._dashBodyOf.has(ele)) cpu.push(ele); });
@@ -1468,22 +1481,26 @@ export class PixiGraph {
     this._dashUniforms.update();
   }
 
-  /** 점선 몸통을 ele.view 가 든 묶음의 메시에 등록(교체). */
-  private _setDashBody(ele: PixiGraphElement, chunk: Container, body: DashBody): void {
-    let batch = this._dashBatches.get(chunk);
-    if (!batch) {
+  /** 점선 몸통(분할 엣지면 점선 구간마다 하나)을 ele.view 가 든 묶음의 메시에 등록(교체). 빈 배열 = 몸통 없음 표시만. */
+  private _setDashBody(ele: PixiGraphElement, chunk: Container, bodies: DashBody[]): void {
+    this._clearDashBody(ele);
+    let batch = this._dashBatches.get(chunk) ?? null;
+    if (!batch && bodies.length) {
       batch = new DashBatch(chunk, this._dashUniforms, () => this._dashUnsupported());
       this._dashBatches.set(chunk, batch);
     }
-    this._clearDashBody(ele);
-    batch.set(ele, body);
-    const period = body.dash + body.gap;
-    this._dashBodyOf.set(ele, { batch, period, global: body.useGlobal });
-    if (body.useGlobal) {
-      const had = this._dashPeriods.has(period);
+    if (bodies.length) batch!.set(ele, bodies);
+    const periods: number[] = [];
+    let sync = false;
+    bodies.forEach((body) => {
+      if (!body.useGlobal) return;
+      const period = body.dash + body.gap;
+      periods.push(period);
+      if (!this._dashPeriods.has(period)) sync = true;
       this._dashPeriods.set(period, (this._dashPeriods.get(period) ?? 0) + 1);
-      if (!had) this._syncDashUniform();
-    }
+    });
+    if (sync) this._syncDashUniform();
+    this._dashBodyOf.set(ele, { batch: bodies.length ? batch : null, periods });
   }
 
   /** 점선 몸통 해제(없으면 무시). */
@@ -1491,12 +1508,12 @@ export class PixiGraph {
     const b = this._dashBodyOf.get(ele);
     if (!b) return;
     this._dashBodyOf.delete(ele);
-    b.batch.delete(ele);
-    if (b.global) {
-      const n = (this._dashPeriods.get(b.period) ?? 1) - 1;
-      if (n > 0) this._dashPeriods.set(b.period, n);
-      else this._dashPeriods.delete(b.period);
-    }
+    b.batch?.delete(ele);
+    b.periods.forEach((period) => {
+      const n = (this._dashPeriods.get(period) ?? 1) - 1;
+      if (n > 0) this._dashPeriods.set(period, n);
+      else this._dashPeriods.delete(period);
+    });
   }
 
   /**
@@ -2530,7 +2547,18 @@ export class PixiGraph {
         }
       }
       pts.push({ x: endX, y: endY });
-      this._drawSplitEdge(g, pts, edgeSplit, { stroke: color, width, alpha, lineDash, lineGap, dashOffset: lineDashOffset });
+      const base = { stroke: color, width, alpha, lineDash, lineGap, dashOffset: lineDashOffset };
+      if (this._gpuDash && g.parent) {
+        // GPU dash — 점선 구간은 묶음 메시(offset 은 uniform), 실선 구간만 Graphics. 점선 구간이 없어도 등록해
+        //   setDashOffset 이 이 엣지를 다시 그리지 않게 한다.
+        const useGlobal = s.lineDashOffset == null;
+        const out: DashBody[] = [];
+        this._drawSplitEdge(g, pts, edgeSplit, base, {
+          phase: (useGlobal ? 0 : Number(s.lineDashOffset)) + (this._dashPhases ? (this._dashPhases.get(ele.id()) ?? 0) : 0),
+          useGlobal, order: this._seq.get(ele) ?? 0, out,
+        });
+        this._setDashBody(ele, g.parent, out);
+      } else this._drawSplitEdge(g, pts, edgeSplit, base);
     } else if (drawLine) {
       let meshBody = false;
       if (lineDash > 0) {
@@ -2549,11 +2577,11 @@ export class PixiGraph {
           const flat: number[] = [];
           pts.forEach((p) => { flat.push(p.x, p.y); });
           const useGlobal = s.lineDashOffset == null;
-          this._setDashBody(ele, g.parent, {
+          this._setDashBody(ele, g.parent, [{
             pts: flat, halfW, dash: lineDash, gap: lineGap,
             phase: (useGlobal ? 0 : Number(s.lineDashOffset)) + (this._dashPhases ? (this._dashPhases.get(ele.id()) ?? 0) : 0),
             useGlobal, round: startRound && endRound, color, alpha: Number(alpha), view: g, order: this._seq.get(ele) ?? 0,
-          });
+          }]);
           meshBody = true;
         } else this._dashPolyline(g, pts, lineDash, lineGap, lineDashOffset);
       } else if (isCurve) g.moveTo(startX, startY).quadraticCurveTo(cpX, cpY, endX, endY);

@@ -11,6 +11,8 @@
  *   (예전엔 엣지 추가 순서대로 섞여 그려졌다. 하이라이트 점선이 겹친 실선에 묻히지 않는 쪽을 택했다).
  * - 엣지 Graphics(ele.view)는 그대로 남아 화살표·비대칭 캡을 그린다. 소비자가 ele.view 에 거는 alpha·tint·
  *   visible/renderable·변환(회전·축소 애니메이션)은 렌더 직전(onRender) 정점 색/위치에 옮긴다.
+ * - 분할 엣지(setEdgeSplits)는 점선 구간마다 몸통 하나 — 한 키(엣지)에 몸통 여럿. 경로거리는 구간 시작부터, 위상에
+ *   구간 시작거리를 더해 엣지 전체로 이어진 패턴이 된다. 실선 구간은 offset 과 무관하니 Graphics 에 남는다.
  * - WebGL2 전용. 다른 렌더러를 만나면 onUnsupported 로 알려 예전 Graphics 경로로 돌아간다.
  */
 import { Mesh, Geometry, Shader, GlProgram, UniformGroup, Container, Color, type Renderer } from 'pixi.js';
@@ -158,7 +160,8 @@ export class DashBatch {
   private readonly _holder: Container;
   private readonly _geom: Geometry;
   private readonly _shader: Shader;
-  private readonly _recs = new Map<unknown, Rec>();
+  /** 키(엣지) → 몸통들(분할 엣지면 점선 구간마다 하나, 모두 같은 view). */
+  private readonly _recs = new Map<unknown, Rec[]>();
   private _dirty = false;
   /** view 가 바뀐 몸통 — 다음 렌더 직전에 이것만 정점에 옮긴다. */
   private readonly _changed = new Set<Rec>();
@@ -199,36 +202,41 @@ export class DashBatch {
   get size(): number { return this._recs.size; }
   has(key: unknown): boolean { return this._recs.has(key); }
 
-  set(key: unknown, body: DashBody): void {
-    const old = this._recs.get(key);
-    if (old?.useGlobal) this.globalCount--;
-    const rec: Rec = { ...body, v0: 0, vn: 0, kAlpha: NaN, kTint: NaN, kVis: false, kTf: NaN };
-    if (old) this._changed.delete(old);
-    this._recs.set(key, rec);
-    hookView(body.view, () => {
-      if (this._recs.get(key) !== rec) return;
+  /** 키의 몸통들을 교체 — 빈 배열이면 지운다. 몸통들은 같은 view 를 공유해야 한다. */
+  set(key: unknown, bodies: DashBody[]): void {
+    if (!bodies.length) { this.delete(key); return; }
+    this._drop(key);
+    const recs: Rec[] = bodies.map((body) => ({ ...body, v0: 0, vn: 0, kAlpha: NaN, kTint: NaN, kVis: false, kTf: NaN }));
+    this._recs.set(key, recs);
+    hookView(bodies[0].view, () => {
+      if (this._recs.get(key) !== recs) return;
       if (!this._changed.size) this.mesh.touch();
-      this._changed.add(rec);
+      recs.forEach((r) => this._changed.add(r));
     });
-    if (body.useGlobal) this.globalCount++;
+    recs.forEach((r) => { if (r.useGlobal) this.globalCount++; });
     this._markDirty();
   }
 
   delete(key: unknown): void {
-    const old = this._recs.get(key);
+    const old = this._drop(key);
     if (!old) return;
-    if (old.useGlobal) this.globalCount--;
     this._recs.delete(key);
-    this._changed.delete(old);
-    unhookView(old.view);
+    unhookView(old[0].view);
     this._markDirty();
+  }
+
+  /** 키의 기존 몸통을 장부(전역 수·바뀜 목록)에서 뺀다. */
+  private _drop(key: unknown): Rec[] | undefined {
+    const old = this._recs.get(key);
+    old?.forEach((r) => { if (r.useGlobal) this.globalCount--; this._changed.delete(r); });
+    return old;
   }
 
   /** offset 만 바뀜 — 장부에 표시만(다음 렌더가 이 묶음을 그리게). */
   touch(): void { if (this.mesh.visible) this.mesh.touch(); }
 
   destroy(): void {
-    this._recs.forEach((r) => unhookView(r.view));
+    this._recs.forEach((rs) => unhookView(rs[0].view));
     this._recs.clear();
     this._changed.clear();
     try { this.mesh.destroy(); } catch { /* noop */ }
@@ -248,11 +256,11 @@ export class DashBatch {
     const all = this._dirty;
     if (all) this._rebuild();
     if (!all && !this._changed.size) return;
-    const list = all ? this._recs : this._changed;
+    const list: Iterable<Rec> = all ? [...this._recs.values()].flat() : this._changed;
     let colDirty = false, posDirty = false;
-    list.forEach((r: Rec) => {
+    for (const r of list) {
       const v = r.view;
-      if (v.destroyed) return;
+      if (v.destroyed) continue;
       const vis = v.visible && v.renderable;
       const a = v.alpha, t = v.tint;
       if (vis !== r.kVis || a !== r.kAlpha || t !== r.kTint) {
@@ -275,7 +283,7 @@ export class DashBatch {
         }
         posDirty = true;
       }
-    });
+    }
     this._changed.clear();
     if (colDirty) this._geom.getBuffer('aColor').update();
     if (posDirty) this._geom.getBuffer('aPosition').update();
@@ -300,7 +308,8 @@ export class DashBatch {
     // 겹친 점(길이 0 구간)은 빼고 센다.
     const clean = new Map<Rec, number[]>();
     let nv = 0, ni = 0;
-    [...this._recs.values()].sort((a, b) => a.order - b.order).forEach((r) => {
+    // 정렬은 안정 — 같은 엣지의 구간은 경로 순서 그대로.
+    [...this._recs.values()].flat().sort((a, b) => a.order - b.order).forEach((r) => {
       const p = r.pts, q: number[] = [p[0], p[1]];
       for (let i = 2; i + 1 < p.length; i += 2) {
         if (Math.hypot(p[i] - q[q.length - 2], p[i + 1] - q[q.length - 1]) > 1e-6) q.push(p[i], p[i + 1]);
