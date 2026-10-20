@@ -376,6 +376,17 @@ graph.setFocusColor(null);       // release focus
 
 Both `.dim` and `.focus-dim` are defined by the library's built-in system style rules — they work without you adding any CSS or style rule, and you can override them by declaring the same selector in `graph.style()`.
 
+### Paint (base coloring)
+
+`paint` recolors a named set of elements *without* being a highlight: it never dims other elements, and state styles (`.dim`, `.focus-dim`, `.hovered`, `:selected`) and highlights still apply on top of it. Use it for "this group is shown in its own color" — e.g. layer/category colors — and keep highlights for transient emphasis such as hover or search.
+
+```ts
+graph.paint({ id: 'cat-pump', elements: pumps, style: { fill: '#22c55e', stroke: '#22c55e', alpha: 0.45 } });
+graph.unpaint('cat-pump');
+graph.unpaintByPrefix('cat-');
+graph.paintIds();                      // active paint ids, in order
+```
+
 ## Undo / Redo
 
 `graph.history` automatically records `add` / `remove` / move / resize / rotate / `data` edits.
@@ -568,7 +579,7 @@ new PixiGraph({
 `fit` · `center` · `panToElement` · `panToElements` · `panToBbox` · `zoom` · `pan` · `viewport` (the `PixiGraphViewport` instance, or `null`)
 
 ### Highlights
-`highlight` · `unhighlight` · `unhighlightByPrefix` · `clearHighlights` · `hasHighlight` · `highlightIds` · `setFocusColor` · `getFocusColor`
+`highlight` · `unhighlight` · `unhighlightByPrefix` · `clearHighlights` · `hasHighlight` · `highlightIds` · `setFocusColor` · `getFocusColor` · `paint` · `unpaint` · `unpaintByPrefix` · `hasPaint` · `paintIds`
 
 ### History
 `history` (a `PixiGraphHistory`: `undo` · `redo` · `canUndo` · `canRedo` · `clear` · `onChange` · `beginBatch` · `endBatch` · `suspend` · `resume` · `record*`)

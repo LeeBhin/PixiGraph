@@ -375,6 +375,24 @@ export class PixiGraph {
   /** user 가 graph.style 로 등록한 규칙 — 시스템 rules 와 결합 전 캐시. */
   private _userStyleRules: PixiGraphStyleRule[] = [];
 
+  /** paint 규칙 뒤에 오는 규칙(생성자 기본 규칙 또는 시스템 + user 규칙). */
+  private _ruleTail: PixiGraphStyleRule[] = [];
+
+  /**
+   * paint 그룹 — id → { 전용 클래스, 규칙, element 목록 }. 하이라이트와 달리 "기본 색칠" 이다:
+   *  - 규칙 목록 맨 앞(시스템 규칙보다 먼저)에 클래스 규칙으로 들어간다 → `node`/`edge` 같은 그룹 규칙은
+   *    이기고, `.dim`·`.focus-dim`·`.hovered`·`:selected` 처럼 클래스/상태 규칙에는 진다(같거나 높은 specificity, 나중 선언).
+   *  - auto-dim 에 끼지 않는다 — 다른 element 를 흐리게 하지도, 자기 element 를 흐림에서 빼 주지도 않는다.
+   */
+  private readonly _paints = new Map<string, { cls: string; rule: PixiGraphStyleRule; elements: PixiGraphElement[] }>();
+  private _paintSeq = 0;
+
+  private _rebuildRules(): void {
+    const paintRules: PixiGraphStyleRule[] = [];
+    this._paints.forEach((p) => paintRules.push(p.rule));
+    this.styleEngine.setRules([...paintRules, ...this._ruleTail]);
+  }
+
   constructor(config: PixiGraphConfig = {}) {
     this._gpuDash = config.gpuDash !== false;
     this._content = new Container();
@@ -466,11 +484,12 @@ export class PixiGraph {
     this.edgeDefaults = { ...DEFAULT_PIXIGRAPH_STYLE.edge, ...(config.style?.edge ?? {}) };
 
     // 기본 규칙 — base group style + 시스템 rules. 외부 graph.style() 호출 시에도 시스템 rules 보존.
-    this.styleEngine.setRules([
+    this._ruleTail = [
       { selector: 'node', style: this.nodeDefaults },
       { selector: 'edge', style: this.edgeDefaults },
       ...this._systemStyleRules,
-    ]);
+    ];
+    this._rebuildRules();
 
     // 이벤트 위임 — graph 가 elementAt(hit-test) 만 노출. DOM 은 외부 책임.
     this.eventBus = new PixiGraphEventBus({
@@ -742,7 +761,7 @@ export class PixiGraph {
     par.forEach((e) => { if (e !== ele) this.renderElement(e); });
   }
 
-  /** 모든 element 제거. graph.view 자체는 유지 (다시 add 가능). highlight 그룹도 같이 clear. */
+  /** 모든 element 제거. graph.view 자체는 유지 (다시 add 가능). highlight·paint 그룹도 같이 clear. */
   clear(): void {
     this.elementMap.forEach((ele) => {
       this.highlightManager._onElementRemoved(ele);
@@ -759,6 +778,8 @@ export class PixiGraph {
       layer.removeChildren().forEach((c) => { try { c.destroy(); } catch { /* noop */ } });
     }
     this.elementMap.clear();
+    // paint 그룹도 비운다 — element 가 없어졌으니 규칙만 남으면 다음 add 의 새 element 와 무관한 규칙이 쌓인다.
+    if (this._paints.size) { this._paints.clear(); this._rebuildRules(); }
     this._edgesByPair.clear();
     this._parallelSorted.clear();
     this._edgesByNode.clear();
@@ -850,6 +871,50 @@ export class PixiGraph {
   /** 등록된 모든 highlight 그룹 id (등록 순서). */
   highlightIds(): string[] {
     return this.highlightManager.ids();
+  }
+
+  /**
+   * 기본 색칠(paint) — 그룹 단위로 element 의 바탕 스타일을 바꾼다. 하이라이트가 아니다:
+   * auto-dim 을 일으키지도 막지도 않고, dim·hover·selected 같은 상태 스타일이 그 위에 그대로 적용된다.
+   * 같은 id 로 다시 부르면 교체. 빈 elements 면 (기존 것만 걷고) 아무것도 칠하지 않는다.
+   *
+   * 예: 체크한 심볼 묶음을 그 묶음 색으로 옅게 — graph.paint({ id: 'sym-pump', elements, style: { fill: '#22c55e', alpha: 0.45 } })
+   */
+  paint(input: { id: string; elements: PixiGraphElement[]; style: PixiGraphStyleProps }): void {
+    if (!input?.id) return;
+    this.unpaint(input.id, true);
+    if (!input.elements?.length) { this._rebuildRules(); return; }
+    this._paintSeq += 1;
+    const cls = `__paint${this._paintSeq}`;
+    this._paints.set(input.id, { cls, rule: { selector: `.${cls}`, style: { ...input.style } }, elements: [...input.elements] });
+    this._rebuildRules();
+    input.elements.forEach((ele) => { if (this.elementMap.get(ele.id()) === ele) ele.addClass(cls); });
+  }
+
+  /** paint 그룹 해제. */
+  unpaint(id: string, skipRebuild = false): void {
+    const p = this._paints.get(id);
+    if (!p) return;
+    this._paints.delete(id);
+    p.elements.forEach((ele) => { if (ele.hasClass(p.cls)) ele.removeClass(p.cls); });
+    if (!skipRebuild) this._rebuildRules();
+  }
+
+  /** prefix 로 시작하는 paint 그룹 일괄 해제. */
+  unpaintByPrefix(prefix: string): void {
+    if (!prefix) return;
+    [...this._paints.keys()].forEach((id) => { if (id.startsWith(prefix)) this.unpaint(id, true); });
+    this._rebuildRules();
+  }
+
+  /** 등록된 paint 그룹 id (등록 순서). */
+  paintIds(): string[] {
+    return [...this._paints.keys()];
+  }
+
+  /** paint 그룹 존재 여부. */
+  hasPaint(id: string): boolean {
+    return this._paints.has(id);
   }
 
   /**
@@ -2174,7 +2239,8 @@ export class PixiGraph {
    */
   style(rules: PixiGraphStyleRule[]): void {
     this._userStyleRules = rules ?? [];
-    this.styleEngine.setRules([...this._systemStyleRules, ...this._userStyleRules]);
+    this._ruleTail = [...this._systemStyleRules, ...this._userStyleRules];
+    this._rebuildRules();
     // 즉시 그리지 않고 상태 경로로 모은다 — microtask(또는 flush/hit-test 질의)에 element 당 한 번,
     //   색/alpha 만 바뀐 element 는 다시 그리지 않는다. 같은 틱의 결과가 필요하면 flush().
     this.elementMap.forEach((ele) => this._restyleState(ele));
