@@ -99,25 +99,23 @@ const pointInPolygon = (x: number, y: number, flat: number[]): boolean => {
 };
 
 /**
- * center 에서 toward 방향 ray 가 다각형(flat=[x0,y0,...]) 외곽선과 만나는 점 중
- * center 에 가장 가까운 것(가장 작은 t>0). 없으면 null. polygon 노드의 엣지 끝점 clip 용.
+ * 점 p 에서 다각형(flat=[x0,y0,...]) 외곽선 위의 가장 가까운 점. polygon 노드에 엣지를 붙일 자리 —
+ * 가운데를 겨누지 않고 실제 모양에서 상대 노드와 가장 가까운 곳(p 가 다각형 안이면 가장 가까운 변)에 붙인다.
  */
-const rayPolygonExit = (center: GraphPoint, toward: GraphPoint, flat: number[]): GraphPoint | null => {
-  const dx = toward.x - center.x, dy = toward.y - center.y;
-  if (dx === 0 && dy === 0) return null;
-  let bestT = Infinity;
+const nearestOnPolygon = (p: GraphPoint, flat: number[]): GraphPoint => {
+  let best: GraphPoint = { x: flat[0], y: flat[1] };
+  let bestD = Infinity;
   const n = flat.length / 2;
   for (let i = 0, j = n - 1; i < n; j = i++) {
-    const x1 = flat[j * 2], y1 = flat[j * 2 + 1];
-    const sx = flat[i * 2] - x1, sy = flat[i * 2 + 1] - y1;
-    const denom = dx * sy - dy * sx;
-    if (Math.abs(denom) < 1e-9) continue;          // ray ∥ segment
-    const acx = x1 - center.x, acy = y1 - center.y;
-    const t = (acx * sy - acy * sx) / denom;       // ray 파라미터
-    const u = (acx * dy - acy * dx) / denom;       // segment 파라미터 [0,1]
-    if (t > 1e-6 && u >= 0 && u <= 1 && t < bestT) bestT = t;
+    const ax = flat[j * 2], ay = flat[j * 2 + 1];
+    const dx = flat[i * 2] - ax, dy = flat[i * 2 + 1] - ay;
+    const l2 = dx * dx + dy * dy;
+    const t = l2 === 0 ? 0 : Math.max(0, Math.min(1, ((p.x - ax) * dx + (p.y - ay) * dy) / l2));
+    const x = ax + t * dx, y = ay + t * dy;
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < bestD) { bestD = d; best = { x, y }; }
   }
-  return bestT === Infinity ? null : { x: center.x + dx * bestT, y: center.y + dy * bestT };
+  return best;
 };
 
 /**
@@ -1718,20 +1716,57 @@ export class PixiGraph {
   }
 
   /**
-   * center 에서 toward 방향으로 엣지가 노드 표면에 닿는 점.
-   *  - polygon 노드: 외곽선과 교차점(없으면 bbox fallback) — 큰 bbox 에 엣지 끝이 허공에 뜨는 문제 방지.
-   *  - 그 외: bbox 경계.
-   * (circle 도 bbox 로 충분 — tee/elbow 는 작아 차이 미미.)
+   * center 에서 toward 방향으로 엣지가 노드 표면(bbox 경계)에 닿는 점.
+   * (circle 도 bbox 로 충분 — tee/elbow 는 작아 차이 미미. polygon 노드가 낀 엣지는 _polygonEdgeGeometry 가 맡는다.)
    */
   private _clipToNode(node: PixiGraphElement, center: GraphPoint, toward: GraphPoint): GraphPoint {
-    if (this._nodeShape(node) === 'polygon') {
-      const poly = this._nodePolygonPoints(node);
-      if (poly) {
-        const p = rayPolygonExit(center, toward, poly);
-        if (p) return p;
-      }
-    }
     return clipRayToBbox(center, node.bbox(), toward);
+  }
+
+  /**
+   * polygon 노드가 낀 엣지의 끝점 + AABB — polygon 쪽은 상대 노드에서 가장 가까운 외곽선 위의 점(가운데를 겨누지 않는다),
+   * 상대 쪽은 그 점을 향한 bbox 표면. 상대 노드가 polygon 안이면(설비 안의 심볼) 가장 가까운 변에 붙는다.
+   * 두 끝 사이가 화살표보다 짧거나 뒤집히면(노드가 외곽선에 걸쳐 있다) 붙는 자리에 짧은 화살표만 둔다(겹침 모드와 같다).
+   */
+  private _polygonEdgeGeometry(
+    src: PixiGraphElement, tgt: PixiGraphElement, sPoly: number[] | null, tPoly: number[] | null, arrowSize: number,
+  ): { srcExit: GraphPoint; tgtEntry: GraphPoint; bbox: GraphBbox } {
+    const sc = src.position(), tc = tgt.position();
+    let sEnd: GraphPoint;
+    let tEnd: GraphPoint;
+    if (sPoly && tPoly) {
+      tEnd = nearestOnPolygon(sc, tPoly);
+      sEnd = nearestOnPolygon(tEnd, sPoly);
+      tEnd = nearestOnPolygon(sEnd, tPoly);
+    } else if (sPoly) {
+      sEnd = nearestOnPolygon(tc, sPoly);
+      tEnd = clipRayToBbox(tc, tgt.bbox(), sEnd);
+    } else {
+      tEnd = nearestOnPolygon(sc, tPoly as number[]);
+      sEnd = clipRayToBbox(sc, src.bbox(), tEnd);
+    }
+    // 그어야 할 방향(src 쪽 → tgt 쪽): polygon 의 붙는 자리와 상대 노드 가운데 사이. 겹쳐 길이가 없으면 두 가운데 사이.
+    let rx = sPoly && tPoly ? tEnd.x - sEnd.x : sPoly ? tc.x - sEnd.x : tEnd.x - sc.x;
+    let ry = sPoly && tPoly ? tEnd.y - sEnd.y : sPoly ? tc.y - sEnd.y : tEnd.y - sc.y;
+    if (Math.hypot(rx, ry) < 1e-9) { rx = tc.x - sc.x; ry = tc.y - sc.y; }
+    const rl = Math.hypot(rx, ry);
+    const dx = tEnd.x - sEnd.x, dy = tEnd.y - sEnd.y;
+    let srcExit = sEnd;
+    let tgtEntry = tEnd;
+    if (rl > 1e-9 && (Math.hypot(dx, dy) < arrowSize || dx * rx + dy * ry <= 0)) {
+      // 가까움·겹침 — polygon 의 붙는 자리(둘 다 polygon 이면 두 자리의 가운데)에 짧은 화살표만
+      const c = sPoly && tPoly ? { x: (sEnd.x + tEnd.x) / 2, y: (sEnd.y + tEnd.y) / 2 } : sPoly ? sEnd : tEnd;
+      const half = (arrowSize * 0.6) / 2;
+      srcExit = { x: c.x - (rx / rl) * half, y: c.y - (ry / rl) * half };
+      tgtEntry = { x: c.x + (rx / rl) * half, y: c.y + (ry / rl) * half };
+    }
+    const bbox = {
+      x: Math.min(srcExit.x, tgtEntry.x),
+      y: Math.min(srcExit.y, tgtEntry.y),
+      w: Math.abs(tgtEntry.x - srcExit.x),
+      h: Math.abs(tgtEntry.y - srcExit.y),
+    };
+    return { srcExit, tgtEntry, bbox };
   }
 
   /** 두 노드 사이 엣지의 끝점(표면 clip) + AABB. addEdge / 노드 이동 재계산 공용.
@@ -1743,15 +1778,19 @@ export class PixiGraph {
   } {
     const sc = src.position(), tc = tgt.position();
     const sb = src.bbox(), tb = tgt.bbox();
+    // edge default 에서 화살표 크기 동적 읽기 — 하드코딩 대신 (per-edge style 은 컨텍스트 없음).
+    const _rawWidth = Number(this.edgeDefaults.width ?? 1);
+    const ARROW_SIZE = Number(this.edgeDefaults.arrowSize ?? _rawWidth * 3);
+    // polygon 노드가 낀 엣지 — 실제 모양에서 가장 가까운 곳에 붙인다(큰 bbox 의 겹침·가운데 겨누기를 쓰지 않는다)
+    const sPoly = this._nodeShape(src) === 'polygon' ? this._nodePolygonPoints(src) : null;
+    const tPoly = this._nodeShape(tgt) === 'polygon' ? this._nodePolygonPoints(tgt) : null;
+    if (sPoly || tPoly) return this._polygonEdgeGeometry(src, tgt, sPoly, tPoly, ARROW_SIZE);
     // bbox AABB 겹침이면(접점 포함) clip 시 srcExit/tgtEntry 가 뒤바뀌어 방향 반전 →
     //   각 center 에서 상대 방향으로 stub 만 늘림. node dim 의 일부 + 두 center 거리의 절반 cap.
     const aabbOverlap = sb.x < tb.x + tb.w && tb.x < sb.x + sb.w
                      && sb.y < tb.y + tb.h && tb.y < sb.y + sb.h;
     let srcExit: GraphPoint;
     let tgtEntry: GraphPoint;
-    // edge default 에서 화살표 크기 동적 읽기 — 하드코딩 대신 (per-edge style 은 컨텍스트 없음).
-    const _rawWidth = Number(this.edgeDefaults.width ?? 1);
-    const ARROW_SIZE = Number(this.edgeDefaults.arrowSize ?? _rawWidth * 3);
     if (aabbOverlap) {
       const tcInSb = tc.x >= sb.x && tc.x <= sb.x + sb.w && tc.y >= sb.y && tc.y <= sb.y + sb.h;
       const scInTb = sc.x >= tb.x && sc.x <= tb.x + tb.w && sc.y >= tb.y && sc.y <= tb.y + tb.h;
