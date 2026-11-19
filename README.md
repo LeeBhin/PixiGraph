@@ -145,7 +145,7 @@ graph.add({
 | `target` | `string` | Target node id. |
 | `data` | `Record<string, unknown>` | Optional metadata. |
 
-Edges automatically clip to node surfaces (polygon outline intersection for polygon nodes, bbox boundary otherwise) and bow apart when multiple edges share the same node pair.
+Edges automatically clip to node surfaces (bbox boundary) and bow apart when multiple edges share the same node pair. An edge touching a polygon node attaches at the point of the polygon outline nearest to the other node instead of aiming at the polygon's center (a node inside the polygon attaches to the nearest side).
 
 ## Styling
 
